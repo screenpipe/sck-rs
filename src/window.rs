@@ -1,10 +1,106 @@
 //! Window capture using ScreenCaptureKit via cidre
 
+use core_foundation::base::{CFType, TCFType};
+use core_foundation::dictionary::CFDictionaryRef;
+use core_foundation::number::CFNumber;
+use core_foundation::string::CFString;
+use core_graphics::window::{
+    kCGNullWindowID, kCGWindowListOptionOnScreenOnly, kCGWindowListExcludeDesktopElements,
+    CGWindowListCopyWindowInfo,
+};
 use image::RgbaImage;
+use std::collections::HashMap;
 use tracing::debug;
 
 use crate::capture;
 use crate::error::{XCapError, XCapResult};
+
+/// Get window info from CGWindowList API as a fallback
+/// Returns a HashMap of window_id -> (app_name, title, pid)
+fn get_cgwindow_info() -> HashMap<u32, (String, String, i32)> {
+    let mut info = HashMap::new();
+
+    unsafe {
+        let options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+        let window_list = CGWindowListCopyWindowInfo(options, kCGNullWindowID);
+
+        if window_list.is_null() {
+            return info;
+        }
+
+        let cf_array = core_foundation::array::CFArray::<CFType>::wrap_under_create_rule(
+            window_list as core_foundation::array::CFArrayRef
+        );
+        let count = cf_array.len();
+
+        for i in 0..count {
+            if let Some(dict) = cf_array.get(i) {
+                let dict_ref = dict.as_CFTypeRef() as CFDictionaryRef;
+
+                // Get window ID
+                let window_id = get_cf_number_value(dict_ref, "kCGWindowNumber").unwrap_or(-1);
+                if window_id <= 0 {
+                    continue;
+                }
+
+                // Get owner name (app name)
+                let owner_name = get_cf_string_value(dict_ref, "kCGWindowOwnerName")
+                    .unwrap_or_default();
+
+                // Get window name (title)
+                let window_name = get_cf_string_value(dict_ref, "kCGWindowName")
+                    .unwrap_or_default();
+
+                // Get owner PID
+                let owner_pid = get_cf_number_value(dict_ref, "kCGWindowOwnerPID").unwrap_or(-1);
+
+                info.insert(window_id as u32, (owner_name, window_name, owner_pid));
+            }
+        }
+    }
+
+    info
+}
+
+/// Get a string value from a CFDictionary
+fn get_cf_string_value(dict: CFDictionaryRef, key: &str) -> Option<String> {
+    unsafe {
+        let cf_key = CFString::new(key);
+        let mut value: *const std::ffi::c_void = std::ptr::null();
+
+        let found = core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+            dict,
+            cf_key.as_concrete_TypeRef() as *const _,
+            &mut value,
+        );
+        if found != 0 && !value.is_null() {
+            let cf_string = CFString::wrap_under_get_rule(value as core_foundation::string::CFStringRef);
+            Some(cf_string.to_string())
+        } else {
+            None
+        }
+    }
+}
+
+/// Get a number value from a CFDictionary
+fn get_cf_number_value(dict: CFDictionaryRef, key: &str) -> Option<i32> {
+    unsafe {
+        let cf_key = CFString::new(key);
+        let mut value: *const std::ffi::c_void = std::ptr::null();
+
+        let found = core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+            dict,
+            cf_key.as_concrete_TypeRef() as *const _,
+            &mut value,
+        );
+        if found != 0 && !value.is_null() {
+            let cf_number = CFNumber::wrap_under_get_rule(value as core_foundation::number::CFNumberRef);
+            cf_number.to_i32()
+        } else {
+            None
+        }
+    }
+}
 
 /// Represents a capturable window
 ///
@@ -45,17 +141,36 @@ impl Window {
             return Err(XCapError::no_windows());
         }
 
+        // Get CGWindow info as fallback for when SCK doesn't provide app metadata
+        let cgwindow_info = get_cgwindow_info();
+
         let windows: Vec<Window> = sc_windows
             .iter()
             .filter_map(|w| {
-                // Get window properties
+                let window_id = w.id();
+
+                // Get window properties from SCK first
                 let title = w.title()
                     .map(|s| s.to_string())
                     .unwrap_or_default();
 
-                let app_name = w.owning_app()
-                    .map(|app| app.app_name().to_string())
-                    .unwrap_or_default();
+                let (mut app_name, mut pid) = match w.owning_app() {
+                    Some(app) => (app.app_name().to_string(), app.process_id()),
+                    None => (String::new(), -1),
+                };
+
+                // Fallback to CGWindow API if SCK didn't provide app info
+                if app_name.is_empty() || pid < 0 {
+                    if let Some((cg_app_name, _cg_title, cg_pid)) = cgwindow_info.get(&window_id) {
+                        if app_name.is_empty() && !cg_app_name.is_empty() {
+                            debug!("Using CGWindow fallback for app_name: {} -> {}", window_id, cg_app_name);
+                            app_name = cg_app_name.clone();
+                        }
+                        if pid < 0 && *cg_pid >= 0 {
+                            pid = *cg_pid;
+                        }
+                    }
+                }
 
                 // Get window frame
                 let frame = w.frame();
@@ -68,17 +183,13 @@ impl Window {
                     return None;
                 }
 
-                let pid = w.owning_app()
-                    .map(|app| app.process_id())
-                    .unwrap_or(-1);
-
                 debug!(
                     "Found window: id={}, app={}, title={}, {}x{} at ({}, {})",
-                    w.id(), app_name, title, width, height, frame.origin.x, frame.origin.y
+                    window_id, app_name, title, width, height, frame.origin.x, frame.origin.y
                 );
 
                 Some(Window {
-                    window_id: w.id(),
+                    window_id,
                     app_name,
                     title,
                     pid,
