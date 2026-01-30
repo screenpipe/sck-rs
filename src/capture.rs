@@ -58,6 +58,12 @@ pub fn get_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>
     }
 }
 
+// FFI bindings for non-planar pixel buffer functions (not exposed by cidre)
+extern "C" {
+    fn CVPixelBufferGetBytesPerRow(pixelBuffer: *const std::ffi::c_void) -> usize;
+    fn CVPixelBufferGetBaseAddress(pixelBuffer: *const std::ffi::c_void) -> *const u8;
+}
+
 /// Extract an RGBA image from a cv::ImageBuf (pixel buffer)
 fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     // Get all metadata BEFORE locking
@@ -65,20 +71,6 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     let height = image_buf.height();
     let plane_count = image_buf.plane_count();
     let pixel_format = image_buf.pixel_format();
-
-    // For non-planar buffers, calculate bytes_per_row; for planar, get from buffer
-    let bytes_per_row = if plane_count == 0 {
-        // Non-planar buffer - for BGRA, bytes_per_row = width * 4
-        width * 4
-    } else {
-        // Planar buffer - get from plane 0
-        image_buf.plane_bytes_per_row(0)
-    };
-
-    debug!(
-        "Converting image buffer: {}x{}, plane_count={}, format={:?}, bytes_per_row={}",
-        width, height, plane_count, pixel_format, bytes_per_row
-    );
 
     // Lock the buffer for reading using raw lock/unlock
     let lock_flags = cv::pixel_buffer::LockFlags::READ_ONLY;
@@ -89,8 +81,23 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
         return Err(XCapError::capture_failed(format!("Failed to lock pixel buffer: {:?}", lock_result)));
     }
 
-    // Get base address while locked
-    let pixels_ptr = image_buf.plane_base_address(0);
+    // Get bytes_per_row and base address based on buffer type
+    // For non-planar buffers (plane_count == 0), use non-plane functions
+    // For planar buffers, use plane functions
+    let (bytes_per_row, pixels_ptr) = if plane_count == 0 {
+        // Non-planar buffer - use CVPixelBufferGetBytesPerRow/GetBaseAddress
+        let bpr = unsafe { CVPixelBufferGetBytesPerRow(image_buf as *const _ as *const std::ffi::c_void) };
+        let ptr = unsafe { CVPixelBufferGetBaseAddress(image_buf as *const _ as *const std::ffi::c_void) };
+        (bpr, ptr)
+    } else {
+        // Planar buffer - use plane functions
+        (image_buf.plane_bytes_per_row(0), image_buf.plane_base_address(0))
+    };
+
+    debug!(
+        "Converting image buffer: {}x{}, plane_count={}, format={:?}, bytes_per_row={}",
+        width, height, plane_count, pixel_format, bytes_per_row
+    );
 
     let result = if pixels_ptr.is_null() {
         Err(XCapError::capture_failed("Pixel buffer base address is null"))
