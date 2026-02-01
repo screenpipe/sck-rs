@@ -1,5 +1,6 @@
 //! Monitor/Display capture using ScreenCaptureKit via cidre
 
+use core_graphics::display::CGDisplay;
 use image::RgbaImage;
 use tracing::debug;
 
@@ -19,11 +20,15 @@ pub struct Monitor {
     x: i32,
     /// Display Y position
     y: i32,
-    /// Display width in pixels
+    /// Display width in physical pixels (actual framebuffer resolution)
     width: u32,
-    /// Display height in pixels
+    /// Display height in physical pixels (actual framebuffer resolution)
     height: u32,
-    /// Scale factor (for Retina displays)
+    /// Logical width (what macOS reports for UI layout)
+    logical_width: u32,
+    /// Logical height (what macOS reports for UI layout)
+    logical_height: u32,
+    /// Scale factor (for Retina displays) - ratio of physical to logical pixels
     scale_factor: f64,
     /// Whether this is the primary display
     is_primary: bool,
@@ -58,13 +63,35 @@ impl Monitor {
             .iter()
             .map(|d| {
                 let frame = d.frame();
-                let width = d.width() as u32;
-                let height = d.height() as u32;
                 let display_id = d.display_id().0; // Extract u32 from DirectDisplayId
+                
+                // Get logical dimensions from ScreenCaptureKit (these are scaled for UI)
+                let logical_width = d.width() as u32;
+                let logical_height = d.height() as u32;
+                
+                // Get actual physical pixel dimensions from Core Graphics
+                // CGDisplayPixelsWide/High return the actual framebuffer resolution
+                let cg_display = CGDisplay::new(display_id);
+                let physical_width = cg_display.pixels_wide() as u32;
+                let physical_height = cg_display.pixels_high() as u32;
+                
+                // Calculate scale factor from physical vs logical dimensions
+                // For Retina displays, this will be 2.0; for standard displays, 1.0
+                // For ultrawide or unusual monitors, calculate based on actual ratio
+                let scale_factor = if logical_width > 0 && logical_height > 0 {
+                    let width_scale = physical_width as f64 / logical_width as f64;
+                    let height_scale = physical_height as f64 / logical_height as f64;
+                    // Use the average to handle any rounding differences
+                    (width_scale + height_scale) / 2.0
+                } else {
+                    1.0
+                };
 
                 debug!(
-                    "Found display {}: {}x{} at ({}, {})",
-                    display_id, width, height, frame.origin.x, frame.origin.y
+                    "Found display {}: physical={}x{}, logical={}x{}, scale={:.2}, at ({}, {})",
+                    display_id, physical_width, physical_height, 
+                    logical_width, logical_height, scale_factor,
+                    frame.origin.x, frame.origin.y
                 );
 
                 Monitor {
@@ -72,9 +99,12 @@ impl Monitor {
                     name: format!("Display {}", display_id),
                     x: frame.origin.x as i32,
                     y: frame.origin.y as i32,
-                    width,
-                    height,
-                    scale_factor: 1.0, // TODO: Get actual scale factor from CGDisplay
+                    // Use physical pixels for capture (actual screen resolution)
+                    width: physical_width,
+                    height: physical_height,
+                    logical_width,
+                    logical_height,
+                    scale_factor,
                     is_primary: display_id == primary_id,
                 }
             })
@@ -122,17 +152,28 @@ impl Monitor {
         Ok(self.height)
     }
 
-    /// Get the raw width (non-Result version)
+    /// Get the raw width (non-Result version) - returns physical pixels
     pub fn raw_width(&self) -> u32 {
         self.width
     }
 
-    /// Get the raw height (non-Result version)
+    /// Get the raw height (non-Result version) - returns physical pixels
     pub fn raw_height(&self) -> u32 {
         self.height
     }
 
+    /// Get the logical width (what macOS reports for UI layout)
+    pub fn logical_width(&self) -> u32 {
+        self.logical_width
+    }
+
+    /// Get the logical height (what macOS reports for UI layout)
+    pub fn logical_height(&self) -> u32 {
+        self.logical_height
+    }
+
     /// Get the scale factor (for Retina displays)
+    /// This is the ratio of physical pixels to logical pixels
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
     }
@@ -161,8 +202,10 @@ mod tests {
             name: "Test Display".to_string(),
             x: 0,
             y: 0,
-            width: 1920,
-            height: 1080,
+            width: 3840,      // Physical pixels (4K)
+            height: 2160,
+            logical_width: 1920,  // Logical pixels (what UI sees)
+            logical_height: 1080,
             scale_factor: 2.0,
             is_primary: true,
         };
@@ -171,10 +214,12 @@ mod tests {
         assert_eq!(monitor.name(), "Test Display");
         assert_eq!(monitor.x(), 0);
         assert_eq!(monitor.y(), 0);
-        assert_eq!(monitor.width().unwrap(), 1920);
-        assert_eq!(monitor.height().unwrap(), 1080);
-        assert_eq!(monitor.raw_width(), 1920);
-        assert_eq!(monitor.raw_height(), 1080);
+        assert_eq!(monitor.width().unwrap(), 3840);
+        assert_eq!(monitor.height().unwrap(), 2160);
+        assert_eq!(monitor.raw_width(), 3840);
+        assert_eq!(monitor.raw_height(), 2160);
+        assert_eq!(monitor.logical_width(), 1920);
+        assert_eq!(monitor.logical_height(), 1080);
         assert_eq!(monitor.scale_factor(), 2.0);
         assert!(monitor.is_primary());
     }

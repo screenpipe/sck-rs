@@ -275,12 +275,22 @@ async fn capture_monitor_async(monitor_id: u32, width: u32, height: u32) -> XCap
     let filter = sc::ContentFilter::with_display_excluding_windows(&display, &empty_windows);
 
     // Create stream configuration
+    // Use the physical pixel dimensions passed in (from CGDisplayPixelsWide/High)
+    // This ensures we capture at the actual native resolution of the display
     let mut cfg = sc::StreamCfg::new();
     cfg.set_width(width as usize);
     cfg.set_height(height as usize);
     cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
     cfg.set_shows_cursor(true);
-    cfg.set_scales_to_fit(true);
+    // IMPORTANT: Don't scale to fit - capture at native resolution
+    // This prevents distortion on ultrawide monitors (32:9 aspect ratio like 5120x1440)
+    // When scales_to_fit is true and dimensions don't match exactly, content gets cropped
+    cfg.set_scales_to_fit(false);
+
+    debug!(
+        "Capturing monitor {} at {}x{} (scales_to_fit=false)",
+        monitor_id, width, height
+    );
 
     // Use ScreenshotManager for single frame capture (macOS 14.0+)
     let sample_buf = sc::ScreenshotManager::capture_sample_buf(&filter, &cfg)
@@ -293,7 +303,14 @@ async fn capture_monitor_async(monitor_id: u32, width: u32, height: u32) -> XCap
         .ok_or_else(|| XCapError::capture_failed("Failed to get image buffer from sample"))?
         .retained();
 
-    image_buf_to_rgba(&mut image_buf)
+    let result = image_buf_to_rgba(&mut image_buf)?;
+    
+    debug!(
+        "Captured image: {}x{} (requested {}x{})",
+        result.width(), result.height(), width, height
+    );
+
+    Ok(result)
 }
 
 #[cfg(test)]
