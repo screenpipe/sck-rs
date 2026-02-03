@@ -65,49 +65,56 @@ impl Monitor {
                 let frame = d.frame();
                 let display_id = d.display_id().0; // Extract u32 from DirectDisplayId
                 
-                // Get logical dimensions from ScreenCaptureKit (these are scaled for UI)
-                let logical_width = d.width() as u32;
-                let logical_height = d.height() as u32;
-                
-                // Get actual physical pixel dimensions from Core Graphics
-                // CGDisplayPixelsWide/High return the actual framebuffer resolution
+                // Get dimensions from multiple sources for comparison
                 let cg_display = CGDisplay::new(display_id);
-                let raw_physical_width = cg_display.pixels_wide() as u32;
-                let raw_physical_height = cg_display.pixels_high() as u32;
                 
-                // Check display rotation - CGDisplayRotation returns 0, 90, 180, or 270 degrees
-                // For vertical/portrait monitors (rotated 90° or 270°), we need to swap dimensions
-                // because CGDisplayPixelsWide/High return the native panel dimensions,
-                // not the rotated screen dimensions that ScreenCaptureKit expects
+                // Source 1: ScreenCaptureKit's reported dimensions (what SCK thinks the display is)
+                let sck_width = d.width() as u32;
+                let sck_height = d.height() as u32;
+                
+                // Source 2: ScreenCaptureKit frame size (should match above)
+                let frame_width = frame.size.width as u32;
+                let frame_height = frame.size.height as u32;
+                
+                // Source 3: CGDisplayPixelsWide/High (native panel resolution)
+                let cg_pixels_width = cg_display.pixels_wide() as u32;
+                let cg_pixels_height = cg_display.pixels_high() as u32;
+                
+                // Source 4: CGDisplayBounds (current display mode, respects scaling)
+                let cg_bounds = cg_display.bounds();
+                let cg_bounds_width = cg_bounds.size.width as u32;
+                let cg_bounds_height = cg_bounds.size.height as u32;
+                
+                // Check display rotation
                 let rotation = cg_display.rotation();
                 let is_rotated = (rotation - 90.0).abs() < 1.0 || (rotation - 270.0).abs() < 1.0;
                 
-                let (physical_width, physical_height) = if is_rotated {
-                    // Swap dimensions for 90° or 270° rotation (vertical/portrait monitors)
-                    (raw_physical_height, raw_physical_width)
-                } else {
-                    // Keep original dimensions for 0° or 180° rotation
-                    (raw_physical_width, raw_physical_height)
-                };
+                // IMPORTANT: Use ScreenCaptureKit's dimensions for capture
+                // SCK knows what dimensions it expects - using physical pixels causes issues
+                // when user has display scaling (e.g., "More Space" or "Larger Text")
+                // 
+                // For the capture, we use SCK dimensions (logical * backing scale factor)
+                // SCK handles the actual pixel capture internally
+                let (capture_width, capture_height) = (sck_width, sck_height);
                 
-                // Calculate scale factor from physical vs logical dimensions
-                // For Retina displays, this will be 2.0; for standard displays, 1.0
-                // For ultrawide or unusual monitors, calculate based on actual ratio
-                let scale_factor = if logical_width > 0 && logical_height > 0 {
-                    let width_scale = physical_width as f64 / logical_width as f64;
-                    let height_scale = physical_height as f64 / logical_height as f64;
-                    // Use the average to handle any rounding differences
-                    (width_scale + height_scale) / 2.0
+                // Calculate scale factor (for informational purposes)
+                let scale_factor = if sck_width > 0 && sck_height > 0 {
+                    let width_scale = cg_pixels_width as f64 / sck_width as f64;
+                    let height_scale = cg_pixels_height as f64 / sck_height as f64;
+                    ((width_scale + height_scale) / 2.0).max(1.0)
                 } else {
                     1.0
                 };
 
                 debug!(
-                    "Found display {}: physical={}x{} (raw={}x{}, rotation={}°), logical={}x{}, scale={:.2}, at ({}, {})",
-                    display_id, physical_width, physical_height,
-                    raw_physical_width, raw_physical_height, rotation,
-                    logical_width, logical_height, scale_factor,
-                    frame.origin.x, frame.origin.y
+                    "Display {} dimensions - SCK: {}x{}, Frame: {}x{}, CGPixels: {}x{}, CGBounds: {}x{}, rotation: {}°, using: {}x{}",
+                    display_id,
+                    sck_width, sck_height,
+                    frame_width, frame_height,
+                    cg_pixels_width, cg_pixels_height,
+                    cg_bounds_width, cg_bounds_height,
+                    rotation,
+                    capture_width, capture_height
                 );
 
                 Monitor {
@@ -115,11 +122,11 @@ impl Monitor {
                     name: format!("Display {}", display_id),
                     x: frame.origin.x as i32,
                     y: frame.origin.y as i32,
-                    // Use physical pixels for capture (actual screen resolution)
-                    width: physical_width,
-                    height: physical_height,
-                    logical_width,
-                    logical_height,
+                    // Use SCK's dimensions - it knows what it expects
+                    width: capture_width,
+                    height: capture_height,
+                    logical_width: cg_bounds_width,
+                    logical_height: cg_bounds_height,
                     scale_factor,
                     is_primary: display_id == primary_id,
                 }
