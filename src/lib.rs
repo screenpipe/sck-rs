@@ -13,7 +13,7 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use xcap_sck::{Window, Monitor};
+//! use sck_rs::{Window, Monitor};
 //!
 //! // Capture all windows
 //! let windows = Window::all().unwrap();
