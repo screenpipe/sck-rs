@@ -3,6 +3,7 @@
 use cidre::{cv, ns, sc};
 use image::RgbaImage;
 use once_cell::sync::Lazy;
+use std::panic;
 use tokio::runtime::Runtime;
 use tracing::debug;
 
@@ -25,12 +26,27 @@ pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
 }
 
 /// Run a sync closure in a separate thread to avoid nested runtime issues
-pub fn run_in_thread<F, T>(f: F) -> T
+///
+/// If the spawned thread panics, this returns an error instead of propagating
+/// the panic to the calling thread (which would cause abort via panic_cannot_unwind).
+pub fn run_in_thread<F, T>(f: F) -> XCapResult<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    std::thread::spawn(f).join().expect("Thread panicked")
+    match std::thread::spawn(f).join() {
+        Ok(result) => Ok(result),
+        Err(panic_info) => {
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                format!("Thread panicked: {}", s)
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                format!("Thread panicked: {}", s)
+            } else {
+                "Thread panicked with unknown payload".to_string()
+            };
+            Err(XCapError::capture_failed(msg))
+        }
+    }
 }
 
 /// Get shareable content synchronously
@@ -52,7 +68,7 @@ pub fn get_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>
 
     // If we're in a tokio runtime, run in a separate thread to avoid nested runtime panic
     if tokio::runtime::Handle::try_current().is_ok() {
-        run_in_thread(fetch)
+        run_in_thread(fetch)?
     } else {
         fetch()
     }
@@ -71,6 +87,20 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     let height = image_buf.height();
     let plane_count = image_buf.plane_count();
     let pixel_format = image_buf.pixel_format();
+
+    // Validate dimensions before any unsafe operations
+    if width == 0 || height == 0 {
+        return Err(XCapError::capture_failed(format!(
+            "Invalid image buffer dimensions: {}x{}", width, height
+        )));
+    }
+
+    // Guard against absurdly large buffers (>256 megapixels)
+    if width > 16384 || height > 16384 {
+        return Err(XCapError::capture_failed(format!(
+            "Image buffer dimensions too large: {}x{}", width, height
+        )));
+    }
 
     // Lock the buffer for reading using raw lock/unlock
     let lock_flags = cv::pixel_buffer::LockFlags::READ_ONLY;
@@ -101,9 +131,28 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
 
     let result = if pixels_ptr.is_null() {
         Err(XCapError::capture_failed("Pixel buffer base address is null"))
+    } else if bytes_per_row == 0 {
+        Err(XCapError::capture_failed("Pixel buffer bytes_per_row is 0"))
+    } else if bytes_per_row < width * 4 {
+        Err(XCapError::capture_failed(format!(
+            "bytes_per_row ({}) is less than width * 4 ({}), buffer may be corrupt",
+            bytes_per_row, width * 4
+        )))
     } else {
+        // Validate data_size won't overflow
+        let data_size = match bytes_per_row.checked_mul(height) {
+            Some(size) if size > 0 => size,
+            _ => {
+                // Must unlock before returning
+                let _ = unsafe { image_buf.unlock_lock_base_addr(lock_flags) };
+                return Err(XCapError::capture_failed(format!(
+                    "Invalid buffer size: bytes_per_row={} * height={} overflows or is zero",
+                    bytes_per_row, height
+                )));
+            }
+        };
+
         // Create a slice from the raw pixel data
-        let data_size = bytes_per_row * height;
         let pixels = unsafe { std::slice::from_raw_parts(pixels_ptr, data_size) };
 
         // Copy and convert BGRA to RGBA
@@ -136,6 +185,17 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     result
 }
 
+/// Safely call image_buf_to_rgba with catch_unwind to prevent panics from
+/// corrupt pixel buffers from crashing the entire application.
+fn safe_image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| image_buf_to_rgba(image_buf))) {
+        Ok(result) => result,
+        Err(_) => Err(XCapError::capture_failed(
+            "Panic in image_buf_to_rgba: pixel buffer may be corrupt or deallocated",
+        )),
+    }
+}
+
 /// Capture a single frame from a window using ScreenCaptureKit
 ///
 /// This captures the display containing the window and crops to the window bounds.
@@ -143,7 +203,7 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
 pub fn capture_window_sync(window_id: u32, width: u32, height: u32) -> XCapResult<RgbaImage> {
     // If we're in a tokio runtime, run in a separate thread to avoid nested runtime panic
     if tokio::runtime::Handle::try_current().is_ok() {
-        run_in_thread(move || block_on(capture_window_async(window_id, width, height)))
+        run_in_thread(move || block_on(capture_window_async(window_id, width, height)))?
     } else {
         block_on(capture_window_async(window_id, width, height))
     }
@@ -222,8 +282,8 @@ async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCap
         .ok_or_else(|| XCapError::capture_failed("Failed to get image buffer from sample"))?
         .retained();
 
-    // Convert to RGBA
-    let full_image = image_buf_to_rgba(&mut image_buf)?;
+    // Convert to RGBA (with catch_unwind safety net)
+    let full_image = safe_image_buf_to_rgba(&mut image_buf)?;
 
     // Calculate crop coordinates relative to display origin
     let crop_x = (window_x - display_frame.origin.x) as u32;
@@ -250,7 +310,7 @@ async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCap
 pub fn capture_monitor_sync(monitor_id: u32, width: u32, height: u32) -> XCapResult<RgbaImage> {
     // If we're in a tokio runtime, run in a separate thread to avoid nested runtime panic
     if tokio::runtime::Handle::try_current().is_ok() {
-        run_in_thread(move || block_on(capture_monitor_async(monitor_id, width, height)))
+        run_in_thread(move || block_on(capture_monitor_async(monitor_id, width, height)))?
     } else {
         block_on(capture_monitor_async(monitor_id, width, height))
     }
@@ -303,7 +363,8 @@ async fn capture_monitor_async(monitor_id: u32, width: u32, height: u32) -> XCap
         .ok_or_else(|| XCapError::capture_failed("Failed to get image buffer from sample"))?
         .retained();
 
-    let result = image_buf_to_rgba(&mut image_buf)?;
+    // Convert to RGBA (with catch_unwind safety net)
+    let result = safe_image_buf_to_rgba(&mut image_buf)?;
     
     debug!(
         "Captured image: {}x{} (requested {}x{})",
