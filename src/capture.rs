@@ -49,8 +49,24 @@ where
     }
 }
 
-/// Get shareable content synchronously
-pub fn get_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
+// CoreGraphics FFI for display enumeration fallback
+extern "C" {
+    fn CGGetOnlineDisplayList(
+        max_displays: u32,
+        online_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
+}
+
+/// Check how many displays CoreGraphics sees (more reliable than SCK after wake)
+fn cg_online_display_count() -> u32 {
+    let mut count: u32 = 0;
+    let err = unsafe { CGGetOnlineDisplayList(0, std::ptr::null_mut(), &mut count) };
+    if err == 0 { count } else { 0 }
+}
+
+/// Fetch SCShareableContent once
+fn fetch_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
     let fetch = || {
         block_on(async {
             sc::ShareableContent::current()
@@ -66,12 +82,46 @@ pub fn get_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>
         })
     };
 
-    // If we're in a tokio runtime, run in a separate thread to avoid nested runtime panic
     if tokio::runtime::Handle::try_current().is_ok() {
         run_in_thread(fetch)?
     } else {
         fetch()
     }
+}
+
+/// Get shareable content synchronously.
+///
+/// After sleep/wake, SCK can return 0 displays even though the display is
+/// active. When this happens and CoreGraphics still sees displays, retry
+/// with increasing delays to give SCK time to resync with the WindowServer.
+pub fn get_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
+    let content = fetch_shareable_content()?;
+    if !content.displays().is_empty() {
+        return Ok(content);
+    }
+
+    // SCK returned 0 displays — check CoreGraphics as ground truth
+    let cg_count = cg_online_display_count();
+    if cg_count == 0 {
+        // Genuinely no displays (lid closed, no external monitor)
+        return Ok(content);
+    }
+
+    // CG sees displays but SCK doesn't — SCK is stale after wake.
+    // Retry with increasing delays.
+    debug!("SCK returned 0 displays but CG sees {} — retrying after wake", cg_count);
+    for delay_ms in [200, 500, 1000, 2000, 3000] {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let content = fetch_shareable_content()?;
+        if !content.displays().is_empty() {
+            debug!("SCK recovered after {}ms delay", delay_ms);
+            return Ok(content);
+        }
+    }
+
+    // Still empty after ~7s — return what we have (caller handles empty)
+    debug!("SCK still empty after retries, returning empty content");
+    fetch_shareable_content()
 }
 
 // FFI bindings for non-planar pixel buffer functions (not exposed by cidre)
