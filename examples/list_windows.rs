@@ -27,10 +27,7 @@ fn main() {
 
                 let focus_marker = if focused { " *** FOCUSED ***" } else { "" };
 
-                println!(
-                    "[{}] {} - \"{}\"{}",
-                    id, app, title, focus_marker
-                );
+                println!("[{}] {} - \"{}\"{}", id, app, title, focus_marker);
                 println!(
                     "     PID: {} | Size: {}x{} | Pos: ({}, {}) | Layer: {} | Min: {}",
                     pid, width, height, x, y, layer, minimized
@@ -39,10 +36,17 @@ fn main() {
             }
 
             // Summary
-            let focused: Vec<_> = windows.iter().filter(|w| w.is_focused().unwrap_or(false)).collect();
+            let focused: Vec<_> = windows
+                .iter()
+                .filter(|w| w.is_focused().unwrap_or(false))
+                .collect();
             println!("--- {} focused window(s) ---", focused.len());
             for w in &focused {
-                println!("  {} - \"{}\"", w.app_name().unwrap_or_default(), w.title().unwrap_or_default());
+                println!(
+                    "  {} - \"{}\"",
+                    w.app_name().unwrap_or_default(),
+                    w.title().unwrap_or_default()
+                );
             }
         }
         Err(e) => {

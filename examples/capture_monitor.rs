@@ -18,7 +18,11 @@ fn main() {
                 let height = monitor.height().unwrap_or(0);
                 let x = monitor.x();
                 let y = monitor.y();
-                let primary = if monitor.is_primary() { " (Primary)" } else { "" };
+                let primary = if monitor.is_primary() {
+                    " (Primary)"
+                } else {
+                    ""
+                };
 
                 println!(
                     "[{}] {}{} - {}x{} at ({}, {})",

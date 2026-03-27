@@ -67,59 +67,54 @@ impl Window {
         // Get the frontmost app PID once for all windows
         let frontmost_pid = get_frontmost_pid();
 
-        let windows: Vec<Window> = sc_windows
-            .iter()
-            .filter_map(|w| {
-                // Get window properties
-                let title = w
-                    .title()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
+        let windows: Vec<Window> =
+            sc_windows
+                .iter()
+                .filter_map(|w| {
+                    // Get window properties
+                    let title = w.title().map(|s| s.to_string()).unwrap_or_default();
 
-                let (app_name, pid) = match w.owning_app() {
-                    Some(app) => (
-                        app.app_name().to_string(),
-                        app.process_id(),
-                    ),
-                    None => (String::new(), -1),
-                };
-                let is_app_active = pid >= 0 && pid == frontmost_pid;
+                    let (app_name, pid) = match w.owning_app() {
+                        Some(app) => (app.app_name().to_string(), app.process_id()),
+                        None => (String::new(), -1),
+                    };
+                    let is_app_active = pid >= 0 && pid == frontmost_pid;
 
-                // Get window layer (0 = normal, >0 = overlay/floating)
-                let window_layer = w.window_layer();
+                    // Get window layer (0 = normal, >0 = overlay/floating)
+                    let window_layer = w.window_layer();
 
-                // Get window frame
-                let frame = w.frame();
-                let width = frame.size.width as u32;
-                let height = frame.size.height as u32;
+                    // Get window frame
+                    let frame = w.frame();
+                    let width = frame.size.width as u32;
+                    let height = frame.size.height as u32;
 
-                // Skip windows that are too small (likely invisible)
-                if width < 10 || height < 10 {
-                    debug!("Skipping small window: {} ({}x{})", title, width, height);
-                    return None;
-                }
+                    // Skip windows that are too small (likely invisible)
+                    if width < 10 || height < 10 {
+                        debug!("Skipping small window: {} ({}x{})", title, width, height);
+                        return None;
+                    }
 
-                debug!(
+                    debug!(
                     "Found window: id={}, app={}, title={}, {}x{} at ({}, {}), layer={}, active={}",
                     w.id(), app_name, title, width, height, frame.origin.x, frame.origin.y,
                     window_layer, is_app_active
                 );
 
-                Some(Window {
-                    window_id: w.id(),
-                    app_name,
-                    title,
-                    pid,
-                    x: frame.origin.x as i32,
-                    y: frame.origin.y as i32,
-                    width,
-                    height,
-                    is_on_screen: w.is_on_screen(),
-                    is_app_active,
-                    window_layer,
+                    Some(Window {
+                        window_id: w.id(),
+                        app_name,
+                        title,
+                        pid,
+                        x: frame.origin.x as i32,
+                        y: frame.origin.y as i32,
+                        width,
+                        height,
+                        is_on_screen: w.is_on_screen(),
+                        is_app_active,
+                        window_layer,
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
         if windows.is_empty() {
             return Err(XCapError::no_windows());
@@ -289,7 +284,7 @@ mod tests {
             height: 600,
             is_on_screen: true,
             is_app_active: false, // Not the frontmost app
-            window_layer: 0,     // Normal window level
+            window_layer: 0,      // Normal window level
         };
 
         assert!(!window.is_focused().unwrap());

@@ -21,7 +21,7 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 ///
 /// Note: This must be called from outside a tokio runtime context.
 /// For use within async code, use the async capture functions directly.
-pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     RUNTIME.block_on(f)
 }
 
@@ -29,7 +29,7 @@ pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
 ///
 /// If the spawned thread panics, this returns an error instead of propagating
 /// the panic to the calling thread (which would cause abort via panic_cannot_unwind).
-pub fn run_in_thread<F, T>(f: F) -> XCapResult<T>
+pub(crate) fn run_in_thread<F, T>(f: F) -> XCapResult<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -62,23 +62,31 @@ extern "C" {
 fn cg_online_display_count() -> u32 {
     let mut count: u32 = 0;
     let err = unsafe { CGGetOnlineDisplayList(0, std::ptr::null_mut(), &mut count) };
-    if err == 0 { count } else { 0 }
+    if err == 0 {
+        count
+    } else {
+        0
+    }
 }
 
 /// Fetch SCShareableContent once
 fn fetch_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
     let fetch = || {
         block_on(async {
-            sc::ShareableContent::current()
-                .await
-                .map_err(|e| {
-                    let err_str = format!("{:?}", e);
-                    if err_str.contains("permission") || err_str.contains("denied") || err_str.contains("-3801") {
-                        XCapError::permission_denied()
-                    } else {
-                        XCapError::capture_failed(format!("Failed to get shareable content: {}", err_str))
-                    }
-                })
+            sc::ShareableContent::current().await.map_err(|e| {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("permission")
+                    || err_str.contains("denied")
+                    || err_str.contains("-3801")
+                {
+                    XCapError::permission_denied()
+                } else {
+                    XCapError::capture_failed(format!(
+                        "Failed to get shareable content: {}",
+                        err_str
+                    ))
+                }
+            })
         })
     };
 
@@ -109,7 +117,10 @@ pub fn get_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>
 
     // CG sees displays but SCK doesn't — SCK is stale after wake.
     // Retry with increasing delays.
-    debug!("SCK returned 0 displays but CG sees {} — retrying after wake", cg_count);
+    debug!(
+        "SCK returned 0 displays but CG sees {} — retrying after wake",
+        cg_count
+    );
     for delay_ms in [200, 500, 1000, 2000, 3000] {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let content = fetch_shareable_content()?;
@@ -141,14 +152,16 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     // Validate dimensions before any unsafe operations
     if width == 0 || height == 0 {
         return Err(XCapError::capture_failed(format!(
-            "Invalid image buffer dimensions: {}x{}", width, height
+            "Invalid image buffer dimensions: {}x{}",
+            width, height
         )));
     }
 
     // Guard against absurdly large buffers (>256 megapixels)
     if width > 16384 || height > 16384 {
         return Err(XCapError::capture_failed(format!(
-            "Image buffer dimensions too large: {}x{}", width, height
+            "Image buffer dimensions too large: {}x{}",
+            width, height
         )));
     }
 
@@ -158,7 +171,10 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     // Lock
     let lock_result = unsafe { image_buf.lock_base_addr(lock_flags) };
     if lock_result.is_err() {
-        return Err(XCapError::capture_failed(format!("Failed to lock pixel buffer: {:?}", lock_result)));
+        return Err(XCapError::capture_failed(format!(
+            "Failed to lock pixel buffer: {:?}",
+            lock_result
+        )));
     }
 
     // Get bytes_per_row and base address based on buffer type
@@ -166,12 +182,19 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     // For planar buffers, use plane functions
     let (bytes_per_row, pixels_ptr) = if plane_count == 0 {
         // Non-planar buffer - use CVPixelBufferGetBytesPerRow/GetBaseAddress
-        let bpr = unsafe { CVPixelBufferGetBytesPerRow(image_buf as *const _ as *const std::ffi::c_void) };
-        let ptr = unsafe { CVPixelBufferGetBaseAddress(image_buf as *const _ as *const std::ffi::c_void) };
+        let bpr = unsafe {
+            CVPixelBufferGetBytesPerRow(image_buf as *const _ as *const std::ffi::c_void)
+        };
+        let ptr = unsafe {
+            CVPixelBufferGetBaseAddress(image_buf as *const _ as *const std::ffi::c_void)
+        };
         (bpr, ptr)
     } else {
         // Planar buffer - use plane functions
-        (image_buf.plane_bytes_per_row(0), image_buf.plane_base_address(0))
+        (
+            image_buf.plane_bytes_per_row(0),
+            image_buf.plane_base_address(0),
+        )
     };
 
     debug!(
@@ -180,13 +203,16 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     );
 
     let result = if pixels_ptr.is_null() {
-        Err(XCapError::capture_failed("Pixel buffer base address is null"))
+        Err(XCapError::capture_failed(
+            "Pixel buffer base address is null",
+        ))
     } else if bytes_per_row == 0 {
         Err(XCapError::capture_failed("Pixel buffer bytes_per_row is 0"))
     } else if bytes_per_row < width * 4 {
         Err(XCapError::capture_failed(format!(
             "bytes_per_row ({}) is less than width * 4 ({}), buffer may be corrupt",
-            bytes_per_row, width * 4
+            bytes_per_row,
+            width * 4
         )))
     } else {
         // Validate data_size won't overflow
@@ -216,7 +242,7 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
                     // BGRA to RGBA conversion
                     buffer.push(pixels[pixel_start + 2]); // R
                     buffer.push(pixels[pixel_start + 1]); // G
-                    buffer.push(pixels[pixel_start]);     // B
+                    buffer.push(pixels[pixel_start]); // B
                     buffer.push(pixels[pixel_start + 3]); // A
                 }
             }
@@ -229,7 +255,10 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     // Unlock
     let unlock_result = unsafe { image_buf.unlock_lock_base_addr(lock_flags) };
     if unlock_result.is_err() {
-        debug!("Warning: failed to unlock pixel buffer: {:?}", unlock_result);
+        debug!(
+            "Warning: failed to unlock pixel buffer: {:?}",
+            unlock_result
+        );
     }
 
     result
@@ -237,7 +266,7 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
 
 /// Safely call image_buf_to_rgba with catch_unwind to prevent panics from
 /// corrupt pixel buffers from crashing the entire application.
-fn safe_image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
+pub(crate) fn safe_image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     match panic::catch_unwind(panic::AssertUnwindSafe(|| image_buf_to_rgba(image_buf))) {
         Ok(result) => result,
         Err(_) => Err(XCapError::capture_failed(
@@ -262,9 +291,9 @@ pub fn capture_window_sync(window_id: u32, width: u32, height: u32) -> XCapResul
 /// Async version of window capture
 async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCapResult<RgbaImage> {
     // Get shareable content
-    let content = sc::ShareableContent::current()
-        .await
-        .map_err(|e| XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e)))?;
+    let content = sc::ShareableContent::current().await.map_err(|e| {
+        XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e))
+    })?;
 
     // Find the window
     let windows = content.windows();
@@ -366,59 +395,82 @@ pub fn capture_monitor_sync(monitor_id: u32, width: u32, height: u32) -> XCapRes
     }
 }
 
-/// Async version of monitor capture
+/// Async version of monitor capture.
+///
+/// Uses a persistent SCStream when possible (reuses a single stream per monitor).
+/// Falls back to one-shot ScreenshotManager if the persistent stream fails.
 async fn capture_monitor_async(monitor_id: u32, width: u32, height: u32) -> XCapResult<RgbaImage> {
-    // Get shareable content
-    let content = sc::ShareableContent::current()
-        .await
-        .map_err(|e| XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e)))?;
+    // Try persistent stream first
+    match crate::stream_manager::capture_monitor_persistent(monitor_id, width, height).await {
+        Ok(image) => {
+            debug!(
+                "persistent stream: captured {}x{} for display {}",
+                image.width(),
+                image.height(),
+                monitor_id
+            );
+            return Ok(image);
+        }
+        Err(e) => {
+            debug!(
+                "persistent stream failed for display {}, falling back to one-shot: {}",
+                monitor_id, e
+            );
+        }
+    }
 
-    // Find the display
+    // Fallback: one-shot ScreenshotManager (original path)
+    capture_monitor_oneshot(monitor_id, width, height).await
+}
+
+/// One-shot monitor capture via ScreenshotManager (fallback path).
+async fn capture_monitor_oneshot(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+) -> XCapResult<RgbaImage> {
+    let content = sc::ShareableContent::current().await.map_err(|e| {
+        XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e))
+    })?;
+
     let displays = content.displays();
     let display = displays
         .iter()
         .find(|d| d.display_id().0 == monitor_id)
         .ok_or_else(|| XCapError::monitor_not_found(monitor_id))?;
 
-    // Create content filter for this display (excluding no windows)
     let empty_windows = ns::Array::new();
     let filter = sc::ContentFilter::with_display_excluding_windows(&display, &empty_windows);
 
-    // Create stream configuration
-    // Use the physical pixel dimensions passed in (from CGDisplayPixelsWide/High)
-    // This ensures we capture at the actual native resolution of the display
     let mut cfg = sc::StreamCfg::new();
     cfg.set_width(width as usize);
     cfg.set_height(height as usize);
     cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
     cfg.set_shows_cursor(true);
-    // IMPORTANT: Don't scale to fit - capture at native resolution
-    // This prevents distortion on ultrawide monitors (32:9 aspect ratio like 5120x1440)
-    // When scales_to_fit is true and dimensions don't match exactly, content gets cropped
     cfg.set_scales_to_fit(false);
 
     debug!(
-        "Capturing monitor {} at {}x{} (scales_to_fit=false)",
+        "one-shot: capturing monitor {} at {}x{}",
         monitor_id, width, height
     );
 
-    // Use ScreenshotManager for single frame capture (macOS 14.0+)
     let sample_buf = sc::ScreenshotManager::capture_sample_buf(&filter, &cfg)
         .await
         .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
 
-    // Get the image buffer from the sample buffer
     let mut image_buf = sample_buf
         .image_buf()
         .ok_or_else(|| XCapError::capture_failed("Failed to get image buffer from sample"))?
         .retained();
 
-    // Convert to RGBA (with catch_unwind safety net)
     let result = safe_image_buf_to_rgba(&mut image_buf)?;
-    
+
     debug!(
-        "Captured image: {}x{} (requested {}x{})",
-        result.width(), result.height(), width, height
+        "one-shot: captured {}x{} (requested {}x{})",
+        result.width(),
+        result.height(),
+        width,
+        height
     );
 
     Ok(result)
