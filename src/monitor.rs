@@ -187,8 +187,18 @@ impl Monitor {
     /// Capture an image of the monitor
     ///
     /// Returns an RGBA image of the entire monitor.
+    /// Uses a persistent SCStream internally (reuses across calls).
     pub fn capture_image(&self) -> XCapResult<RgbaImage> {
         capture::capture_monitor_sync(self.display_id, self.width, self.height)
+    }
+
+    /// Stop the persistent capture stream for this monitor.
+    ///
+    /// The stream will be recreated automatically on the next `capture_image()` call.
+    /// Use this when pausing capture (e.g., for DRM content) to fully release
+    /// ScreenCaptureKit handles.
+    pub fn stop_stream(&self) {
+        crate::stream_manager::invalidate_monitor_stream(self.display_id);
     }
 }
 

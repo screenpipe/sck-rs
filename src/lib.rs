@@ -33,14 +33,16 @@
 
 #![cfg(target_os = "macos")]
 
-mod error;
-mod window;
-mod monitor;
 mod capture;
+mod error;
+mod monitor;
+mod stream_manager;
+mod window;
 
 pub use error::{XCapError, XCapResult};
-pub use window::Window;
 pub use monitor::Monitor;
+pub use stream_manager::{invalidate_monitor_stream, stop_all_streams};
+pub use window::Window;
 
 /// Check if ScreenCaptureKit is available on this system (macOS 12.3+)
 pub fn is_supported() -> bool {
