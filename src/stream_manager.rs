@@ -171,6 +171,12 @@ impl MonitorStream {
             excluded_window_ids.len()
         );
 
+        // Store sorted IDs so comparisons are order-independent — prevents
+        // needless stream recreation when the OS enumerates windows in a
+        // different order between calls.
+        let mut sorted_ids = excluded_window_ids.to_vec();
+        sorted_ids.sort_unstable();
+
         Ok(Self {
             _stream: stream,
             _output: output,
@@ -179,7 +185,7 @@ impl MonitorStream {
             frame_notify,
             width,
             height,
-            excluded_window_ids: excluded_window_ids.to_vec(),
+            excluded_window_ids: sorted_ids,
         })
     }
 
@@ -246,6 +252,10 @@ impl StreamManager {
         height: u32,
         excluded_window_ids: &[u32],
     ) -> XCapResult<RgbaImage> {
+        // Sort incoming IDs for order-independent comparison with stored set
+        let mut sorted_input = excluded_window_ids.to_vec();
+        sorted_input.sort_unstable();
+
         // Fast path: stream exists, matches params, and has a frame
         {
             let streams = MANAGER
@@ -255,7 +265,7 @@ impl StreamManager {
             if let Some(ms) = streams.get(&monitor_id) {
                 if ms.width == width
                     && ms.height == height
-                    && ms.excluded_window_ids == excluded_window_ids
+                    && ms.excluded_window_ids == sorted_input
                 {
                     if let Some(frame) = ms.latest_frame() {
                         return Ok(frame);
@@ -318,6 +328,9 @@ impl StreamManager {
         height: u32,
         excluded_window_ids: &[u32],
     ) -> XCapResult<()> {
+        let mut sorted_input = excluded_window_ids.to_vec();
+        sorted_input.sort_unstable();
+
         let mut streams = MANAGER
             .streams
             .lock()
@@ -327,7 +340,7 @@ impl StreamManager {
         if let Some(existing) = streams.get(&monitor_id) {
             if existing.width == width
                 && existing.height == height
-                && existing.excluded_window_ids == excluded_window_ids
+                && existing.excluded_window_ids == sorted_input
             {
                 return Ok(()); // already have it
             }
