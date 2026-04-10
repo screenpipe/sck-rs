@@ -86,10 +86,20 @@ struct MonitorStream {
     frame_notify: Arc<tokio::sync::Notify>,
     width: u32,
     height: u32,
+    /// SCK window IDs currently excluded from this stream's ContentFilter.
+    /// When this changes, the stream must be recreated.
+    excluded_window_ids: Vec<u32>,
 }
 
 impl MonitorStream {
-    fn new(sc_display: &sc::Display, width: u32, height: u32, fps: i32) -> XCapResult<Self> {
+    fn new(
+        sc_display: &sc::Display,
+        content: &sc::ShareableContent,
+        width: u32,
+        height: u32,
+        fps: i32,
+        excluded_window_ids: &[u32],
+    ) -> XCapResult<Self> {
         let latest_frame = Arc::new(Mutex::new(None));
         let frame_notify = Arc::new(tokio::sync::Notify::new());
 
@@ -110,8 +120,31 @@ impl MonitorStream {
         cfg.set_scales_to_fit(false);
         cfg.set_minimum_frame_interval(cm::Time::new(1, fps));
 
-        let empty_windows = ns::Array::new();
-        let filter = sc::ContentFilter::with_display_excluding_windows(sc_display, &empty_windows);
+        // Build exclusion filter — excluded windows are not rendered by the OS
+        let filter = if excluded_window_ids.is_empty() {
+            let empty = ns::Array::new();
+            sc::ContentFilter::with_display_excluding_windows(sc_display, &empty)
+        } else {
+            let sc_windows = content.windows();
+            let mut to_exclude: Vec<&sc::Window> = Vec::new();
+            for w in sc_windows.iter() {
+                if excluded_window_ids.contains(&w.id()) {
+                    to_exclude.push(w);
+                }
+            }
+            if to_exclude.is_empty() {
+                let empty = ns::Array::new();
+                sc::ContentFilter::with_display_excluding_windows(sc_display, &empty)
+            } else {
+                debug!(
+                    "persistent stream: excluding {} window(s) for display {}",
+                    to_exclude.len(),
+                    sc_display.display_id().0
+                );
+                let arr = ns::Array::from_slice(&to_exclude);
+                sc::ContentFilter::with_display_excluding_windows(sc_display, &arr)
+            }
+        };
 
         let stream = sc::Stream::new(&filter, &cfg);
 
@@ -130,11 +163,12 @@ impl MonitorStream {
         .map_err(|e| XCapError::capture_failed(format!("stream start error: {:?}", e)))?;
 
         info!(
-            "persistent SCK stream started for display {} ({}x{}, {}fps)",
+            "persistent SCK stream started for display {} ({}x{}, {}fps, {} excluded)",
             sc_display.display_id().0,
             width,
             height,
-            fps
+            fps,
+            excluded_window_ids.len()
         );
 
         Ok(Self {
@@ -145,6 +179,7 @@ impl MonitorStream {
             frame_notify,
             width,
             height,
+            excluded_window_ids: excluded_window_ids.to_vec(),
         })
     }
 
@@ -202,32 +237,41 @@ impl StreamManager {
     /// On first call for a monitor, creates a persistent SCStream and waits
     /// up to 3s for the first frame. Subsequent calls return the latest
     /// buffered frame immediately.
-    pub async fn capture(monitor_id: u32, width: u32, height: u32) -> XCapResult<RgbaImage> {
-        // Fast path: stream exists and has a frame
+    ///
+    /// If `excluded_window_ids` changes from the current stream's exclusion
+    /// list, the stream is invalidated and recreated with the new filter.
+    pub async fn capture(
+        monitor_id: u32,
+        width: u32,
+        height: u32,
+        excluded_window_ids: &[u32],
+    ) -> XCapResult<RgbaImage> {
+        // Fast path: stream exists, matches params, and has a frame
         {
             let streams = MANAGER
                 .streams
                 .lock()
                 .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
             if let Some(ms) = streams.get(&monitor_id) {
-                // Check dimensions match
-                if ms.width == width && ms.height == height {
+                if ms.width == width
+                    && ms.height == height
+                    && ms.excluded_window_ids == excluded_window_ids
+                {
                     if let Some(frame) = ms.latest_frame() {
                         return Ok(frame);
                     }
                     // Stream exists but no frame yet — wait below
                 } else {
-                    // Resolution changed — need to recreate
                     debug!(
-                        "stream resolution mismatch for display {} ({}x{} vs {}x{}), recreating",
-                        monitor_id, ms.width, ms.height, width, height
+                        "stream params changed for display {} (res or exclusions), recreating",
+                        monitor_id
                     );
                 }
             }
         }
 
         // Slow path: create or recreate stream
-        Self::ensure_stream(monitor_id, width, height)?;
+        Self::ensure_stream(monitor_id, width, height, excluded_window_ids)?;
 
         // Wait for first frame
         let streams = MANAGER
@@ -268,19 +312,27 @@ impl StreamManager {
         }
     }
 
-    fn ensure_stream(monitor_id: u32, width: u32, height: u32) -> XCapResult<()> {
+    fn ensure_stream(
+        monitor_id: u32,
+        width: u32,
+        height: u32,
+        excluded_window_ids: &[u32],
+    ) -> XCapResult<()> {
         let mut streams = MANAGER
             .streams
             .lock()
             .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
 
-        // Remove old stream if dimensions changed
+        // Remove old stream if params changed
         if let Some(existing) = streams.get(&monitor_id) {
-            if existing.width == width && existing.height == height {
+            if existing.width == width
+                && existing.height == height
+                && existing.excluded_window_ids == excluded_window_ids
+            {
                 return Ok(()); // already have it
             }
             info!(
-                "recreating stream for display {} (resolution change)",
+                "recreating stream for display {} (params change)",
                 monitor_id
             );
         }
@@ -294,7 +346,7 @@ impl StreamManager {
             .find(|d| d.display_id().0 == monitor_id)
             .ok_or_else(|| XCapError::monitor_not_found(monitor_id))?;
 
-        let ms = MonitorStream::new(sc_display, width, height, 2)?;
+        let ms = MonitorStream::new(sc_display, &content, width, height, 2, excluded_window_ids)?;
         streams.insert(monitor_id, ms);
 
         Ok(())
@@ -327,12 +379,17 @@ impl StreamManager {
 ///
 /// On first call, creates the stream and waits for the first frame.
 /// Subsequent calls return the latest buffered frame immediately.
+///
+/// `excluded_window_ids` — SCK window IDs to exclude from the capture.
+/// If the exclusion list differs from the running stream, the stream is
+/// recreated with the new filter.
 pub async fn capture_monitor_persistent(
     monitor_id: u32,
     width: u32,
     height: u32,
+    excluded_window_ids: &[u32],
 ) -> XCapResult<RgbaImage> {
-    StreamManager::capture(monitor_id, width, height).await
+    StreamManager::capture(monitor_id, width, height, excluded_window_ids).await
 }
 
 /// Stop the persistent stream for a monitor (e.g. for DRM pause).

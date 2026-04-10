@@ -385,13 +385,61 @@ async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCap
     Ok(cropped.to_image())
 }
 
-/// Capture a single frame from a monitor using ScreenCaptureKit
-pub fn capture_monitor_sync(monitor_id: u32, width: u32, height: u32) -> XCapResult<RgbaImage> {
+/// Build an `SCContentFilter` that excludes the given window IDs from the
+/// display capture. If `excluded_window_ids` is empty, returns a filter with
+/// an empty exclusion list (captures everything — same as previous behaviour).
+fn build_exclusion_filter(
+    sc_display: &sc::Display,
+    content: &sc::ShareableContent,
+    excluded_window_ids: &[u32],
+) -> cidre::arc::R<sc::ContentFilter> {
+    if excluded_window_ids.is_empty() {
+        let empty = ns::Array::new();
+        return sc::ContentFilter::with_display_excluding_windows(sc_display, &empty);
+    }
+
+    // Collect sc::Window references that match the exclusion list
+    let sc_windows = content.windows();
+    let mut to_exclude: Vec<&sc::Window> = Vec::new();
+    for w in sc_windows.iter() {
+        if excluded_window_ids.contains(&w.id()) {
+            to_exclude.push(w);
+        }
+    }
+
+    if to_exclude.is_empty() {
+        let empty = ns::Array::new();
+        return sc::ContentFilter::with_display_excluding_windows(sc_display, &empty);
+    }
+
+    debug!(
+        "excluding {} window(s) from display {} capture",
+        to_exclude.len(),
+        sc_display.display_id().0
+    );
+
+    let excluded_array = ns::Array::from_slice(&to_exclude);
+    sc::ContentFilter::with_display_excluding_windows(sc_display, &excluded_array)
+}
+
+/// Capture a single frame from a monitor using ScreenCaptureKit.
+///
+/// `excluded_window_ids` — SCK window IDs to exclude from the capture via
+/// `SCContentFilter(display:excludingWindows:)`. The OS simply won't render
+/// those windows into the capture buffer (zero overhead, pixel-perfect).
+/// Pass an empty slice to capture everything (previous behaviour).
+pub fn capture_monitor_sync(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+    excluded_window_ids: &[u32],
+) -> XCapResult<RgbaImage> {
+    let ids = excluded_window_ids.to_vec();
     // If we're in a tokio runtime, run in a separate thread to avoid nested runtime panic
     if tokio::runtime::Handle::try_current().is_ok() {
-        run_in_thread(move || block_on(capture_monitor_async(monitor_id, width, height)))?
+        run_in_thread(move || block_on(capture_monitor_async(monitor_id, width, height, &ids)))?
     } else {
-        block_on(capture_monitor_async(monitor_id, width, height))
+        block_on(capture_monitor_async(monitor_id, width, height, &ids))
     }
 }
 
@@ -399,9 +447,21 @@ pub fn capture_monitor_sync(monitor_id: u32, width: u32, height: u32) -> XCapRes
 ///
 /// Uses a persistent SCStream when possible (reuses a single stream per monitor).
 /// Falls back to one-shot ScreenshotManager if the persistent stream fails.
-async fn capture_monitor_async(monitor_id: u32, width: u32, height: u32) -> XCapResult<RgbaImage> {
+async fn capture_monitor_async(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+    excluded_window_ids: &[u32],
+) -> XCapResult<RgbaImage> {
     // Try persistent stream first
-    match crate::stream_manager::capture_monitor_persistent(monitor_id, width, height).await {
+    match crate::stream_manager::capture_monitor_persistent(
+        monitor_id,
+        width,
+        height,
+        excluded_window_ids,
+    )
+    .await
+    {
         Ok(image) => {
             debug!(
                 "persistent stream: captured {}x{} for display {}",
@@ -420,7 +480,7 @@ async fn capture_monitor_async(monitor_id: u32, width: u32, height: u32) -> XCap
     }
 
     // Fallback: one-shot ScreenshotManager (original path)
-    capture_monitor_oneshot(monitor_id, width, height).await
+    capture_monitor_oneshot(monitor_id, width, height, excluded_window_ids).await
 }
 
 /// One-shot monitor capture via ScreenshotManager (fallback path).
@@ -428,6 +488,7 @@ async fn capture_monitor_oneshot(
     monitor_id: u32,
     width: u32,
     height: u32,
+    excluded_window_ids: &[u32],
 ) -> XCapResult<RgbaImage> {
     let content = sc::ShareableContent::current().await.map_err(|e| {
         XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e))
@@ -439,8 +500,7 @@ async fn capture_monitor_oneshot(
         .find(|d| d.display_id().0 == monitor_id)
         .ok_or_else(|| XCapError::monitor_not_found(monitor_id))?;
 
-    let empty_windows = ns::Array::new();
-    let filter = sc::ContentFilter::with_display_excluding_windows(&display, &empty_windows);
+    let filter = build_exclusion_filter(&display, &content, excluded_window_ids);
 
     let mut cfg = sc::StreamCfg::new();
     cfg.set_width(width as usize);
