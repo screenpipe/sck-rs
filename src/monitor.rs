@@ -189,7 +189,16 @@ impl Monitor {
     /// Returns an RGBA image of the entire monitor.
     /// Uses a persistent SCStream internally (reuses across calls).
     pub fn capture_image(&self) -> XCapResult<RgbaImage> {
-        capture::capture_monitor_sync(self.display_id, self.width, self.height)
+        capture::capture_monitor_sync(self.display_id, self.width, self.height, &[])
+    }
+
+    /// Capture an image of the monitor, excluding the given SCK window IDs.
+    ///
+    /// The OS will not render excluded windows into the capture buffer
+    /// (zero overhead, pixel-perfect). Use this to hide sensitive apps
+    /// (password managers, banking apps, etc.) from stored frames.
+    pub fn capture_image_excluding(&self, excluded_window_ids: &[u32]) -> XCapResult<RgbaImage> {
+        capture::capture_monitor_sync(self.display_id, self.width, self.height, excluded_window_ids)
     }
 
     /// Stop the persistent capture stream for this monitor.
