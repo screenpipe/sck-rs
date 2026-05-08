@@ -1,6 +1,6 @@
 //! Core capture functionality using ScreenCaptureKit via cidre
 
-use cidre::{cv, ns, sc};
+use cidre::{api, cv, ns, sc};
 use image::RgbaImage;
 use once_cell::sync::Lazy;
 use std::panic;
@@ -348,6 +348,9 @@ async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCap
     cfg.set_height(display_height as usize);
     cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
     cfg.set_shows_cursor(false);
+    if api::macos_available("15.0") {
+        cfg.set_show_mouse_clicks(false);
+    }
     cfg.set_scales_to_fit(false); // Don't scale, capture at native resolution
 
     // Use ScreenshotManager for single frame capture (macOS 14.0+)
@@ -507,6 +510,9 @@ async fn capture_monitor_oneshot(
     cfg.set_height(height as usize);
     cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
     cfg.set_shows_cursor(false);
+    if api::macos_available("15.0") {
+        cfg.set_show_mouse_clicks(false);
+    }
     cfg.set_scales_to_fit(false);
 
     debug!(
