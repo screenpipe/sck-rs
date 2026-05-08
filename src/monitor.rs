@@ -32,6 +32,8 @@ pub struct Monitor {
     scale_factor: f64,
     /// Whether this is the primary display
     is_primary: bool,
+    /// Whether to include the cursor in captured frames (default: false)
+    show_cursor: bool,
 }
 
 impl Monitor {
@@ -108,6 +110,7 @@ impl Monitor {
                     logical_height: cg_bounds_height,
                     scale_factor,
                     is_primary: display_id == primary_id,
+                    show_cursor: false,
                 }
             })
             .collect();
@@ -184,12 +187,23 @@ impl Monitor {
         self.is_primary
     }
 
+    /// Set whether the cursor is shown in captured frames.
+    pub fn set_show_cursor(&mut self, show_cursor: bool) {
+        self.show_cursor = show_cursor;
+    }
+
+    /// Return a clone with `show_cursor` set to the given value.
+    pub fn with_show_cursor(mut self, show_cursor: bool) -> Self {
+        self.show_cursor = show_cursor;
+        self
+    }
+
     /// Capture an image of the monitor
     ///
     /// Returns an RGBA image of the entire monitor.
     /// Uses a persistent SCStream internally (reuses across calls).
     pub fn capture_image(&self) -> XCapResult<RgbaImage> {
-        capture::capture_monitor_sync(self.display_id, self.width, self.height, &[])
+        capture::capture_monitor_sync(self.display_id, self.width, self.height, &[], self.show_cursor)
     }
 
     /// Capture an image of the monitor, excluding the given SCK window IDs.
@@ -198,7 +212,7 @@ impl Monitor {
     /// (zero overhead, pixel-perfect). Use this to hide sensitive apps
     /// (password managers, banking apps, etc.) from stored frames.
     pub fn capture_image_excluding(&self, excluded_window_ids: &[u32]) -> XCapResult<RgbaImage> {
-        capture::capture_monitor_sync(self.display_id, self.width, self.height, excluded_window_ids)
+        capture::capture_monitor_sync(self.display_id, self.width, self.height, excluded_window_ids, self.show_cursor)
     }
 
     /// Stop the persistent capture stream for this monitor.
@@ -228,6 +242,7 @@ mod tests {
             logical_height: 1080,
             scale_factor: 2.0,
             is_primary: true,
+            show_cursor: false,
         };
 
         assert_eq!(monitor.id(), 1);

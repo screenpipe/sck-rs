@@ -433,13 +433,14 @@ pub fn capture_monitor_sync(
     width: u32,
     height: u32,
     excluded_window_ids: &[u32],
+    show_cursor: bool,
 ) -> XCapResult<RgbaImage> {
     let ids = excluded_window_ids.to_vec();
     // If we're in a tokio runtime, run in a separate thread to avoid nested runtime panic
     if tokio::runtime::Handle::try_current().is_ok() {
-        run_in_thread(move || block_on(capture_monitor_async(monitor_id, width, height, &ids)))?
+        run_in_thread(move || block_on(capture_monitor_async(monitor_id, width, height, &ids, show_cursor)))?
     } else {
-        block_on(capture_monitor_async(monitor_id, width, height, &ids))
+        block_on(capture_monitor_async(monitor_id, width, height, &ids, show_cursor))
     }
 }
 
@@ -452,6 +453,7 @@ async fn capture_monitor_async(
     width: u32,
     height: u32,
     excluded_window_ids: &[u32],
+    show_cursor: bool,
 ) -> XCapResult<RgbaImage> {
     // Try persistent stream first
     match crate::stream_manager::capture_monitor_persistent(
@@ -459,6 +461,7 @@ async fn capture_monitor_async(
         width,
         height,
         excluded_window_ids,
+        show_cursor,
     )
     .await
     {
@@ -480,7 +483,7 @@ async fn capture_monitor_async(
     }
 
     // Fallback: one-shot ScreenshotManager (original path)
-    capture_monitor_oneshot(monitor_id, width, height, excluded_window_ids).await
+    capture_monitor_oneshot(monitor_id, width, height, excluded_window_ids, show_cursor).await
 }
 
 /// One-shot monitor capture via ScreenshotManager (fallback path).
@@ -489,6 +492,7 @@ async fn capture_monitor_oneshot(
     width: u32,
     height: u32,
     excluded_window_ids: &[u32],
+    show_cursor: bool,
 ) -> XCapResult<RgbaImage> {
     let content = sc::ShareableContent::current().await.map_err(|e| {
         XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e))
@@ -506,7 +510,7 @@ async fn capture_monitor_oneshot(
     cfg.set_width(width as usize);
     cfg.set_height(height as usize);
     cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
-    cfg.set_shows_cursor(true);
+    cfg.set_shows_cursor(show_cursor);
     cfg.set_scales_to_fit(false);
 
     debug!(
