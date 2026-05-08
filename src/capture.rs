@@ -506,7 +506,7 @@ async fn capture_monitor_oneshot(
     cfg.set_width(width as usize);
     cfg.set_height(height as usize);
     cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
-    cfg.set_shows_cursor(crate::shows_cursor());
+    cfg.set_shows_cursor(false);
     cfg.set_scales_to_fit(false);
 
     debug!(

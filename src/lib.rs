@@ -44,26 +44,6 @@ pub use monitor::Monitor;
 pub use stream_manager::{invalidate_monitor_stream, stop_all_streams};
 pub use window::Window;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-// Default off — capturing the cursor in SCK can lag the live cursor on
-// macOS Sequoia (Apple bug, also observable in plain Swift apps). Callers
-// that want the cursor in their recording must opt in explicitly.
-static SHOWS_CURSOR: AtomicBool = AtomicBool::new(false);
-
-/// Set whether the captured frames should include the system cursor.
-///
-/// Takes effect on subsequently created streams. Existing persistent
-/// streams keep their original setting until invalidated.
-pub fn set_shows_cursor(value: bool) {
-    SHOWS_CURSOR.store(value, Ordering::Relaxed);
-}
-
-/// Current value of the cursor-capture toggle.
-pub fn shows_cursor() -> bool {
-    SHOWS_CURSOR.load(Ordering::Relaxed)
-}
-
 /// Check if ScreenCaptureKit is available on this system (macOS 12.3+)
 pub fn is_supported() -> bool {
     // ScreenCaptureKit requires macOS 12.3+
