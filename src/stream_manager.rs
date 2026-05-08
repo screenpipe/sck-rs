@@ -11,7 +11,7 @@
 //! - Significantly lower CPU overhead at high capture rates
 
 use cidre::{
-    arc, cm, cv, define_obj_type, dispatch, ns, objc, sc,
+    api, arc, cm, cv, define_obj_type, dispatch, ns, objc, sc,
     sc::stream::{Output, OutputImpl},
 };
 use image::RgbaImage;
@@ -119,6 +119,9 @@ impl MonitorStream {
         cfg.set_height(height as usize);
         cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
         cfg.set_shows_cursor(show_cursor);
+        if api::macos_available("15.0") {
+            cfg.set_show_mouse_clicks(false);
+        }
         cfg.set_scales_to_fit(false);
         cfg.set_minimum_frame_interval(cm::Time::new(1, fps));
 
