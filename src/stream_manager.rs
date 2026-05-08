@@ -115,7 +115,7 @@ impl MonitorStream {
         cfg.set_width(width as usize);
         cfg.set_height(height as usize);
         cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
-        cfg.set_shows_cursor(true);
+        cfg.set_shows_cursor(crate::shows_cursor());
         cfg.set_scales_to_fit(false);
         cfg.set_minimum_frame_interval(cm::Time::new(1, fps));
 
