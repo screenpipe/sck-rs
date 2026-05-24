@@ -119,7 +119,12 @@ impl MonitorStream {
         if api::macos_available("15.0") {
             cfg.set_show_mouse_clicks(false);
         }
-        cfg.set_scales_to_fit(false);
+        // scales_to_fit(true) so callers can request a downscaled capture
+        // (target_w/target_h < native) and have the GPU do the resize before
+        // the framebuffer hits replayd. Major WindowServer/replayd cost saver
+        // on HiDPI displays and for OCR-quality (not pixel-perfect) consumers.
+        // No-op when the requested dims equal native.
+        cfg.set_scales_to_fit(true);
         cfg.set_minimum_frame_interval(cm::Time::new(1, fps));
 
         let filter = build_exclusion_filter(sc_display, content, excluded_window_ids);

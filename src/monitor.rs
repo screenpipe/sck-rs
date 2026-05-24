@@ -201,6 +201,35 @@ impl Monitor {
         capture::capture_monitor_sync(self.display_id, self.width, self.height, excluded_window_ids)
     }
 
+    /// Capture an image of the monitor, downscaled at the source.
+    ///
+    /// `max_width` is the upper bound on captured width; height is derived
+    /// from the source aspect ratio. If `max_width >= native_width` this is
+    /// equivalent to `capture_image()` (no downscale).
+    ///
+    /// Cheaper than capturing native and resizing in user space: the GPU
+    /// resizes the framebuffer before `replayd` hands it back, so WindowServer
+    /// composites + reads back a smaller surface. Use for OCR-quality
+    /// consumers that don't need pixel-perfect captures.
+    ///
+    /// Internally reuses the persistent SCStream cache. Different `max_width`
+    /// values for the same monitor will recreate the stream (same caching
+    /// rules as resolution changes).
+    pub fn capture_image_scaled(&self, max_width: u32) -> XCapResult<RgbaImage> {
+        let (target_w, target_h) = scaled_dims(self.width, self.height, max_width);
+        capture::capture_monitor_sync(self.display_id, target_w, target_h, &[])
+    }
+
+    /// Same as `capture_image_scaled` but with window exclusion.
+    pub fn capture_image_scaled_excluding(
+        &self,
+        max_width: u32,
+        excluded_window_ids: &[u32],
+    ) -> XCapResult<RgbaImage> {
+        let (target_w, target_h) = scaled_dims(self.width, self.height, max_width);
+        capture::capture_monitor_sync(self.display_id, target_w, target_h, excluded_window_ids)
+    }
+
     /// Stop the persistent capture stream for this monitor.
     ///
     /// The stream will be recreated automatically on the next `capture_image()` call.
@@ -209,6 +238,19 @@ impl Monitor {
     pub fn stop_stream(&self) {
         crate::stream_manager::invalidate_monitor_stream(self.display_id);
     }
+}
+
+/// Compute target (width, height) capped at `max_width` while preserving
+/// the source aspect ratio. Always returns at least 1×1 to avoid degenerate
+/// SCK configs.
+fn scaled_dims(src_w: u32, src_h: u32, max_width: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || max_width == 0 || max_width >= src_w {
+        return (src_w.max(1), src_h.max(1));
+    }
+    let target_w = max_width;
+    // Preserve aspect ratio with rounding.
+    let target_h = ((max_width as u64 * src_h as u64) + (src_w as u64 / 2)) / src_w as u64;
+    (target_w, (target_h as u32).max(1))
 }
 
 #[cfg(test)]
