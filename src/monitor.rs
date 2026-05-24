@@ -201,6 +201,41 @@ impl Monitor {
         capture::capture_monitor_sync(self.display_id, self.width, self.height, excluded_window_ids)
     }
 
+    /// Capture an image of the monitor via `SCScreenshotManager` (one-shot).
+    ///
+    /// Unlike `capture_image()`, this does *not* keep a persistent SCStream
+    /// alive between calls. WindowServer / replayd wakes only for the frame
+    /// you ask for, then releases the capture path. Trade-offs:
+    ///
+    /// - **Better** for event-driven / bursty consumers (capture on app
+    ///   switch, click, etc.) where capture rate is well below the
+    ///   persistent stream's frame interval — WindowServer cost scales
+    ///   with trigger rate instead of being pinned at the stream rate.
+    /// - **Worse** for sustained high-rate capture: each call pays the
+    ///   `SCShareableContent` enumeration + `captureImage` round-trip
+    ///   (~50–150 ms) instead of a cheap cached-frame read (~5 ms).
+    pub fn capture_image_oneshot(&self) -> XCapResult<RgbaImage> {
+        capture::capture_monitor_oneshot_sync(self.display_id, self.width, self.height, &[])
+    }
+
+    /// Capture an image of the monitor via `SCScreenshotManager` (one-shot),
+    /// excluding the given SCK window IDs.
+    ///
+    /// See [`Self::capture_image_oneshot`] for the persistent-vs-one-shot
+    /// trade-offs and [`Self::capture_image_excluding`] for the exclusion
+    /// semantics.
+    pub fn capture_image_oneshot_excluding(
+        &self,
+        excluded_window_ids: &[u32],
+    ) -> XCapResult<RgbaImage> {
+        capture::capture_monitor_oneshot_sync(
+            self.display_id,
+            self.width,
+            self.height,
+            excluded_window_ids,
+        )
+    }
+
     /// Stop the persistent capture stream for this monitor.
     ///
     /// The stream will be recreated automatically on the next `capture_image()` call.

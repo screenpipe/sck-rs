@@ -486,7 +486,36 @@ async fn capture_monitor_async(
     capture_monitor_oneshot(monitor_id, width, height, excluded_window_ids).await
 }
 
-/// One-shot monitor capture via ScreenshotManager (fallback path).
+/// Sync wrapper around the one-shot `SCScreenshotManager` capture path.
+///
+/// Each call wakes WindowServer / replayd for exactly one frame and then
+/// releases the capture path. The right primitive for event-driven consumers
+/// (capture on app switch, click, typing pause, etc.) — cost scales with
+/// trigger rate, not with stream frame rate.
+///
+/// Contrast with `capture_monitor_sync`, which keeps a persistent SCStream
+/// alive per monitor and is cheaper per-call for sustained capture rates
+/// but pins WindowServer at the stream's frame interval continuously.
+pub fn capture_monitor_oneshot_sync(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+    excluded_window_ids: &[u32],
+) -> XCapResult<RgbaImage> {
+    let ids = excluded_window_ids.to_vec();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        run_in_thread(move || block_on(capture_monitor_oneshot(monitor_id, width, height, &ids)))?
+    } else {
+        block_on(capture_monitor_oneshot(monitor_id, width, height, &ids))
+    }
+}
+
+/// One-shot monitor capture via `SCScreenshotManager`.
+///
+/// Each call wakes WindowServer / replayd for exactly one frame and then
+/// releases the capture path. This is the right primitive for event-driven
+/// consumers (capture on app switch, click, typing pause, etc.) — cost
+/// scales with trigger rate, not with stream frame rate.
 async fn capture_monitor_oneshot(
     monitor_id: u32,
     width: u32,
