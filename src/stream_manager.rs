@@ -30,6 +30,12 @@ use crate::error::{XCapError, XCapResult};
 struct FrameReceiverInner {
     latest_frame: Arc<Mutex<Option<RgbaImage>>>,
     frame_notify: Arc<tokio::sync::Notify>,
+    /// When set, the receiver runs in *push* mode: every delivered frame is
+    /// forwarded to this channel (newest dropped on backpressure) instead of
+    /// latching `latest_frame`. Used by the high-fps HD capture stream so a
+    /// recorder can consume every frame. `None` = the default latch mode used
+    /// by the persistent screenshot stream.
+    frame_tx: Option<tokio::sync::mpsc::Sender<RgbaImage>>,
 }
 
 define_obj_type!(
@@ -67,8 +73,16 @@ impl OutputImpl for FrameReceiver {
             }
         };
 
-        // Store and notify
         let inner = self.inner_mut();
+        // Push mode (HD): forward every frame to the channel and return. Drop
+        // the newest frame on backpressure (`try_send`) so a slow encoder never
+        // stalls this OS callback queue — a dropped frame is just a tiny replay
+        // gap, never a capture hang.
+        if let Some(tx) = inner.frame_tx.as_ref() {
+            let _ = tx.try_send(image);
+            return;
+        }
+        // Latch mode (default): keep only the latest frame + wake waiters.
         if let Ok(mut guard) = inner.latest_frame.lock() {
             *guard = Some(image);
         }
@@ -98,6 +112,7 @@ impl MonitorStream {
         height: u32,
         fps: i32,
         excluded_window_ids: &[u32],
+        frame_tx: Option<tokio::sync::mpsc::Sender<RgbaImage>>,
     ) -> XCapResult<Self> {
         let latest_frame = Arc::new(Mutex::new(None));
         let frame_notify = Arc::new(tokio::sync::Notify::new());
@@ -105,6 +120,7 @@ impl MonitorStream {
         let inner = FrameReceiverInner {
             latest_frame: latest_frame.clone(),
             frame_notify: frame_notify.clone(),
+            frame_tx,
         };
         let output = FrameReceiver::with(inner);
 
@@ -443,7 +459,15 @@ impl StreamManager {
             .find(|d| d.display_id().0 == monitor_id)
             .ok_or_else(|| XCapError::monitor_not_found(monitor_id))?;
 
-        let ms = MonitorStream::new(sc_display, &content, width, height, 2, excluded_window_ids)?;
+        let ms = MonitorStream::new(
+            sc_display,
+            &content,
+            width,
+            height,
+            2,
+            excluded_window_ids,
+            None, // latch mode — the persistent screenshot stream
+        )?;
         streams.insert(monitor_id, ms);
 
         Ok(())
@@ -499,4 +523,91 @@ pub fn invalidate_monitor_stream(monitor_id: u32) {
 /// Stop all persistent streams (for shutdown or DRM pause).
 pub fn stop_all_streams() {
     StreamManager::stop_all();
+}
+
+// ── High-FPS HD capture (push mode) ────────────────────────────────
+
+/// Bounded frame channel depth for the HD capture stream. Small on purpose:
+/// the recorder should consume in real time, so we'd rather drop the newest
+/// frame than let memory grow if it briefly stalls. 8 frames ≈ 0.8s at 10fps.
+const HD_CHANNEL_CAPACITY: usize = 8;
+
+/// Maximum HD capture rate we'll request from ScreenCaptureKit.
+const HD_MAX_FPS: u32 = 60;
+
+/// A standalone high-frame-rate capture stream.
+///
+/// Unlike the persistent screenshot stream (2 fps, latest-frame-only), this
+/// delivers EVERY frame to a channel so a recorder can encode continuous
+/// video. It is independent of the `StreamManager` singleton — a second
+/// `SCStream` coexists with the screenshot stream on the same display (SCK
+/// supports multiple concurrent streams per display), so HD recording never
+/// disturbs the OCR/screenshot path. Drop the handle to stop capture.
+pub struct HdCaptureStream {
+    _inner: MonitorStream,
+    monitor_id: u32,
+    fps: u32,
+}
+
+impl HdCaptureStream {
+    /// The display this stream is capturing.
+    pub fn monitor_id(&self) -> u32 {
+        self.monitor_id
+    }
+    /// The frame rate the stream was started at.
+    pub fn fps(&self) -> u32 {
+        self.fps
+    }
+}
+
+/// Start a dedicated high-fps capture stream for `monitor_id` at `fps`, with
+/// frames GPU-downscaled to `width`x`height`.
+///
+/// Returns the stream handle (drop to stop) and a receiver of RGBA frames.
+/// Under backpressure the newest frame is dropped (`HD_CHANNEL_CAPACITY`), so a
+/// slow consumer can never stall the OS callback. `excluded_window_ids` are
+/// excluded at the OS level — ignored/private windows never reach the recorder.
+///
+/// This blocks briefly while ScreenCaptureKit starts the stream; call it from a
+/// blocking context (e.g. `spawn_blocking`).
+pub fn start_hd_capture(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+    excluded_window_ids: &[u32],
+) -> XCapResult<(HdCaptureStream, tokio::sync::mpsc::Receiver<RgbaImage>)> {
+    let clamped_fps = fps.clamp(1, HD_MAX_FPS);
+    let (tx, rx) = tokio::sync::mpsc::channel(HD_CHANNEL_CAPACITY);
+
+    let content = get_shareable_content()?;
+    let displays = content.displays();
+    let sc_display = displays
+        .iter()
+        .find(|d| d.display_id().0 == monitor_id)
+        .ok_or_else(|| XCapError::monitor_not_found(monitor_id))?;
+
+    let stream = MonitorStream::new(
+        sc_display,
+        &content,
+        width,
+        height,
+        clamped_fps as i32,
+        excluded_window_ids,
+        Some(tx), // push mode — every frame to the channel
+    )?;
+
+    info!(
+        "HD capture stream started for display {} ({}x{} @ {}fps)",
+        monitor_id, width, height, clamped_fps
+    );
+
+    Ok((
+        HdCaptureStream {
+            _inner: stream,
+            monitor_id,
+            fps: clamped_fps,
+        },
+        rx,
+    ))
 }
