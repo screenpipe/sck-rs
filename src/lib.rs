@@ -41,7 +41,9 @@ mod window;
 
 pub use error::{XCapError, XCapResult};
 pub use monitor::Monitor;
-pub use stream_manager::{invalidate_monitor_stream, stop_all_streams};
+pub use stream_manager::{
+    invalidate_monitor_stream, start_hd_capture, stop_all_streams, HdCaptureStream,
+};
 pub use window::Window;
 
 /// Check if ScreenCaptureKit is available on this system (macOS 12.3+)
