@@ -17,6 +17,7 @@ use cidre::{
 use image::RgbaImage;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -36,6 +37,14 @@ struct FrameReceiverInner {
     /// recorder can consume every frame. `None` = the default latch mode used
     /// by the persistent screenshot stream.
     frame_tx: Option<tokio::sync::mpsc::Sender<RgbaImage>>,
+    /// Monotonic count of frames the OS callback has latched (latch mode only).
+    /// Bumped once per delivered frame, so a consumer can tell whether the
+    /// stream is still being fed: if this stops advancing while the stream is
+    /// alive, the OS callback has wedged and `latest_frame` is stale. A static
+    /// screen still advances it — ScreenCaptureKit delivers identical frames at
+    /// the frame interval — which is what makes "seq stalled" mean "frozen
+    /// stream", not "idle screen".
+    frame_seq: Arc<AtomicU64>,
 }
 
 define_obj_type!(
@@ -86,6 +95,9 @@ impl OutputImpl for FrameReceiver {
         if let Ok(mut guard) = inner.latest_frame.lock() {
             *guard = Some(image);
         }
+        // Bump the delivery sequence so consumers can detect a wedged callback
+        // (seq stops advancing) vs. a static screen (seq keeps advancing).
+        inner.frame_seq.fetch_add(1, Ordering::Release);
         inner.frame_notify.notify_waiters();
     }
 }
@@ -98,6 +110,8 @@ struct MonitorStream {
     _queue: arc::R<dispatch::Queue>,
     latest_frame: Arc<Mutex<Option<RgbaImage>>>,
     frame_notify: Arc<tokio::sync::Notify>,
+    /// Shared with the FrameReceiver callback; see `FrameReceiverInner::frame_seq`.
+    frame_seq: Arc<AtomicU64>,
     width: u32,
     height: u32,
     /// Sorted SCK window IDs currently excluded from this stream's ContentFilter.
@@ -116,10 +130,12 @@ impl MonitorStream {
     ) -> XCapResult<Self> {
         let latest_frame = Arc::new(Mutex::new(None));
         let frame_notify = Arc::new(tokio::sync::Notify::new());
+        let frame_seq = Arc::new(AtomicU64::new(0));
 
         let inner = FrameReceiverInner {
             latest_frame: latest_frame.clone(),
             frame_notify: frame_notify.clone(),
+            frame_seq: frame_seq.clone(),
             frame_tx,
         };
         let output = FrameReceiver::with(inner);
@@ -179,6 +195,7 @@ impl MonitorStream {
             _queue: queue,
             latest_frame,
             frame_notify,
+            frame_seq,
             width,
             height,
             excluded_window_ids: sorted_ids,
@@ -219,6 +236,12 @@ impl MonitorStream {
 
     fn latest_frame(&self) -> Option<RgbaImage> {
         self.latest_frame.lock().ok()?.clone()
+    }
+
+    /// Monotonic count of frames the OS callback has latched. See
+    /// `FrameReceiverInner::frame_seq`.
+    fn frame_seq(&self) -> u64 {
+        self.frame_seq.load(Ordering::Acquire)
     }
 
     async fn wait_first_frame(&self, timeout: Duration) -> XCapResult<RgbaImage> {
@@ -523,6 +546,25 @@ pub fn invalidate_monitor_stream(monitor_id: u32) {
 /// Stop all persistent streams (for shutdown or DRM pause).
 pub fn stop_all_streams() {
     StreamManager::stop_all();
+}
+
+/// Current frame-delivery sequence for a monitor's persistent stream, if one
+/// is cached. Monotonic; bumped once per OS-latched frame. `None` when no
+/// stream exists for this monitor yet.
+///
+/// Compare it across captures: if it does not advance while captures keep
+/// happening, the stream's OS callback has wedged and
+/// `capture_monitor_persistent` is returning a stale frame — invalidate and
+/// recreate the stream. A static screen keeps advancing it (SCK delivers
+/// identical frames at the frame interval), so a stalled sequence means a dead
+/// stream, not an idle one.
+pub fn monitor_frame_seq(monitor_id: u32) -> Option<u64> {
+    MANAGER
+        .streams
+        .lock()
+        .ok()?
+        .get(&monitor_id)
+        .map(|ms| ms.frame_seq())
 }
 
 // ── High-FPS HD capture (push mode) ────────────────────────────────
