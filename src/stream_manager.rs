@@ -567,6 +567,18 @@ pub fn monitor_frame_seq(monitor_id: u32) -> Option<u64> {
         .map(|ms| ms.frame_seq())
 }
 
+/// Return the latest latched RGBA frame from an already-running persistent
+/// stream, without waiting or creating a stream. `None` when no stream exists
+/// yet or no frame has been delivered.
+pub fn peek_latest_frame(monitor_id: u32) -> Option<RgbaImage> {
+    MANAGER
+        .streams
+        .lock()
+        .ok()?
+        .get(&monitor_id)
+        .and_then(|ms| ms.latest_frame())
+}
+
 // ── High-FPS HD capture (push mode) ────────────────────────────────
 
 /// Bounded frame channel depth for the HD capture stream. Small on purpose:
