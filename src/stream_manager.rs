@@ -546,6 +546,9 @@ pub fn invalidate_monitor_stream(monitor_id: u32) {
 /// Stop all persistent streams (for shutdown or DRM pause).
 pub fn stop_all_streams() {
     StreamManager::stop_all();
+    // Streams are torn down wholesale on wake / display changes — the cached
+    // window/display snapshot is stale for the same reason the streams are.
+    crate::capture::invalidate_shareable_content_cache();
 }
 
 /// Current frame-delivery sequence for a monitor's persistent stream, if one
