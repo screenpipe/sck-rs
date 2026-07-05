@@ -43,6 +43,7 @@ mod monitor;
 mod stream_manager;
 mod window;
 
+pub use capture::invalidate_shareable_content_cache;
 pub use error::{XCapError, XCapResult};
 pub use monitor::Monitor;
 pub use stream_manager::{
