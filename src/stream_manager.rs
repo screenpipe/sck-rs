@@ -15,7 +15,7 @@
 //! - Significantly lower CPU overhead at high capture rates
 
 use cidre::{
-    api, arc, cm, cv, define_obj_type, dispatch, ns, objc, sc,
+    api, arc, cg, cm, cv, define_obj_type, dispatch, ns, objc, sc,
     sc::stream::{Output, OutputImpl},
 };
 use image::RgbaImage;
@@ -28,19 +28,26 @@ use tracing::{debug, info, warn};
 
 use crate::capture::{get_shareable_content, safe_image_buf_to_rgba};
 use crate::error::{XCapError, XCapResult};
+use crate::frame::{CapturedPixelBuffer, CapturedSample};
+
+/// How the ObjC callback delivers frames.
+enum FrameDelivery {
+    /// Persistent screenshot stream: latch latest RGBA + pixel buffer.
+    Latch,
+    /// HD path (legacy): push CPU RGBA frames.
+    PushRgba(tokio::sync::mpsc::Sender<RgbaImage>),
+    /// HD zero-copy path: push retained CMSampleBuffers.
+    PushSample(tokio::sync::mpsc::Sender<CapturedSample>),
+}
 
 // ── Frame receiver (ObjC callback) ─────────────────────────────────
 
 #[repr(C)]
 struct FrameReceiverInner {
     latest_frame: Arc<Mutex<Option<RgbaImage>>>,
+    latest_pixel_buf: Arc<Mutex<Option<CapturedPixelBuffer>>>,
     frame_notify: Arc<tokio::sync::Notify>,
-    /// When set, the receiver runs in *push* mode: every delivered frame is
-    /// forwarded to this channel (newest dropped on backpressure) instead of
-    /// latching `latest_frame`. Used by the high-fps HD capture stream so a
-    /// recorder can consume every frame. `None` = the default latch mode used
-    /// by the persistent screenshot stream.
-    frame_tx: Option<tokio::sync::mpsc::Sender<RgbaImage>>,
+    delivery: FrameDelivery,
     /// Monotonic count of frames the OS callback has latched (latch mode only).
     /// Bumped once per delivered frame, so a consumer can tell whether the
     /// stream is still being fed: if this stops advancing while the stream is
@@ -72,37 +79,53 @@ impl OutputImpl for FrameReceiver {
             return;
         }
 
-        // Extract image buffer from sample
-        let Some(mut image_buf) = sample_buf.image_buf().map(|b| b.retained()) else {
+        let pts = sample_buf.pts();
+        let Some(image_buf) = sample_buf.image_buf().map(|b| b.retained()) else {
             return;
         };
-
-        // Convert BGRA → RGBA
-        let image = match safe_image_buf_to_rgba(&mut image_buf) {
-            Ok(img) => img,
-            Err(e) => {
-                debug!("stream frame conversion failed: {}", e);
-                return;
-            }
-        };
+        let width = image_buf.width() as u32;
+        let height = image_buf.height() as u32;
 
         let inner = self.inner_mut();
-        // Push mode (HD): forward every frame to the channel and return. Drop
-        // the newest frame on backpressure (`try_send`) so a slow encoder never
-        // stalls this OS callback queue — a dropped frame is just a tiny replay
-        // gap, never a capture hang.
-        if let Some(tx) = inner.frame_tx.as_ref() {
-            let _ = tx.try_send(image);
-            return;
+        match &inner.delivery {
+            // HD zero-copy: retain the CMSampleBuffer and push. No CPU RGBA.
+            FrameDelivery::PushSample(tx) => {
+                let sample = CapturedSample::new(sample_buf.retained(), width, height);
+                let _ = tx.try_send(sample);
+            }
+            // HD legacy: CPU convert then push.
+            FrameDelivery::PushRgba(tx) => {
+                let mut image_buf = image_buf;
+                let image = match safe_image_buf_to_rgba(&mut image_buf) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        debug!("stream frame conversion failed: {}", e);
+                        return;
+                    }
+                };
+                let _ = tx.try_send(image);
+            }
+            // Screenshot latch: keep retained CVPixelBuffer + RGBA for compat.
+            FrameDelivery::Latch => {
+                let pixel = CapturedPixelBuffer::new(image_buf.clone(), pts);
+                let mut image_buf = image_buf;
+                let image = match safe_image_buf_to_rgba(&mut image_buf) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        debug!("stream frame conversion failed: {}", e);
+                        return;
+                    }
+                };
+                if let Ok(mut guard) = inner.latest_pixel_buf.lock() {
+                    *guard = Some(pixel);
+                }
+                if let Ok(mut guard) = inner.latest_frame.lock() {
+                    *guard = Some(image);
+                }
+                inner.frame_seq.fetch_add(1, Ordering::Release);
+                inner.frame_notify.notify_waiters();
+            }
         }
-        // Latch mode (default): keep only the latest frame + wake waiters.
-        if let Ok(mut guard) = inner.latest_frame.lock() {
-            *guard = Some(image);
-        }
-        // Bump the delivery sequence so consumers can detect a wedged callback
-        // (seq stops advancing) vs. a static screen (seq keeps advancing).
-        inner.frame_seq.fetch_add(1, Ordering::Release);
-        inner.frame_notify.notify_waiters();
     }
 }
 
@@ -113,6 +136,7 @@ struct MonitorStream {
     _output: arc::R<FrameReceiver>,
     _queue: arc::R<dispatch::Queue>,
     latest_frame: Arc<Mutex<Option<RgbaImage>>>,
+    latest_pixel_buf: Arc<Mutex<Option<CapturedPixelBuffer>>>,
     frame_notify: Arc<tokio::sync::Notify>,
     /// Shared with the FrameReceiver callback; see `FrameReceiverInner::frame_seq`.
     frame_seq: Arc<AtomicU64>,
@@ -136,17 +160,19 @@ impl MonitorStream {
         height: u32,
         fps: i32,
         excluded_window_ids: &[u32],
-        frame_tx: Option<tokio::sync::mpsc::Sender<RgbaImage>>,
+        delivery: FrameDelivery,
     ) -> XCapResult<Self> {
         let latest_frame = Arc::new(Mutex::new(None));
+        let latest_pixel_buf = Arc::new(Mutex::new(None));
         let frame_notify = Arc::new(tokio::sync::Notify::new());
         let frame_seq = Arc::new(AtomicU64::new(0));
 
         let inner = FrameReceiverInner {
             latest_frame: latest_frame.clone(),
+            latest_pixel_buf: latest_pixel_buf.clone(),
             frame_notify: frame_notify.clone(),
             frame_seq: frame_seq.clone(),
-            frame_tx,
+            delivery,
         };
         let output = FrameReceiver::with(inner);
 
@@ -160,6 +186,24 @@ impl MonitorStream {
         cfg.set_shows_cursor(false);
         if api::macos_available("15.0") {
             cfg.set_show_mouse_clicks(false);
+        }
+        // Shallow buffer queue: each retained slot pins an IOSurface, and the
+        // latch/push consumers only ever want the newest frame. 3 is the OS
+        // minimum/recommended floor — set explicitly so a future SDK default
+        // change can't silently grow resident memory.
+        cfg.set_queue_depth(3);
+        // Explicit sRGB output. Without this, frames arrive in the display's
+        // native color space (Display P3 on modern Macs) and every consumer
+        // pays an implicit conversion — and stored JPEGs (untagged, assumed
+        // sRGB by viewers) render subtly wrong. sRGB at the source means
+        // WindowServer converts once, on the GPU.
+        cfg.set_color_space_name(cg::color_space::names::srgb());
+        // Display captures have no meaningful alpha; declaring the stream
+        // opaque lets the compositor skip alpha premultiply work per frame.
+        // shouldBeOpaque is macOS 14.0+ — unguarded, the selector throws on
+        // 12.3–13.x (same pattern as set_show_mouse_clicks above).
+        if api::macos_available("14.0") {
+            cfg.set_should_be_opaque(true);
         }
         // scales_to_fit(true) so callers can request a downscaled capture
         // (target_w/target_h < native) and have the GPU do the resize before
@@ -204,6 +248,7 @@ impl MonitorStream {
             _output: output,
             _queue: queue,
             latest_frame,
+            latest_pixel_buf,
             frame_notify,
             frame_seq,
             width,
@@ -246,6 +291,9 @@ impl MonitorStream {
         // still latch after this clear — a much narrower window than always
         // serving the stale latch.
         if let Ok(mut guard) = self.latest_frame.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.latest_pixel_buf.lock() {
             *guard = None;
         }
 
@@ -487,7 +535,7 @@ impl StreamManager {
             height,
             2,
             excluded_window_ids,
-            None, // latch mode — the persistent screenshot stream
+            FrameDelivery::Latch,
         )?;
         streams.insert(monitor_id, ms);
 
@@ -646,6 +694,59 @@ pub fn peek_latest_frame_matching(
     )
 }
 
+/// Return the latest latched [`CapturedPixelBuffer`] from an already-running
+/// persistent stream. `None` when no stream exists yet or no frame has been
+/// delivered.
+pub fn peek_latest_pixel_buffer(monitor_id: u32) -> Option<CapturedPixelBuffer> {
+    peek_pixel_buf_where(monitor_id, None)
+}
+
+fn peek_pixel_buf_where(
+    monitor_id: u32,
+    matcher: Option<&dyn Fn(&MonitorStream) -> bool>,
+) -> Option<CapturedPixelBuffer> {
+    let (latest, epoch_handle, epoch_before) = {
+        let streams = MANAGER.streams.lock().ok()?;
+        let ms = streams.get(&monitor_id)?;
+        if let Some(m) = matcher {
+            if !m(ms) {
+                return None;
+            }
+        }
+        (
+            ms.latest_pixel_buf.clone(),
+            ms.filter_epoch.clone(),
+            ms.filter_epoch.load(Ordering::Acquire),
+        )
+    };
+
+    let buf = latest.lock().ok()?.clone()?;
+
+    if matcher.is_some() && epoch_handle.load(Ordering::Acquire) != epoch_before {
+        return None;
+    }
+    Some(buf)
+}
+
+/// Like [`peek_latest_pixel_buffer`], but only if the cached stream matches
+/// `width`/`height`/`excluded_window_ids` (same filter semantics as capture).
+pub fn peek_latest_pixel_buffer_matching(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+    excluded_window_ids: &[u32],
+) -> Option<CapturedPixelBuffer> {
+    let mut sorted = excluded_window_ids.to_vec();
+    sorted.sort_unstable();
+
+    peek_pixel_buf_where(
+        monitor_id,
+        Some(&|ms: &MonitorStream| {
+            ms.width == width && ms.height == height && ms.excluded_window_ids == sorted
+        }),
+    )
+}
+
 // ── High-FPS HD capture (push mode) ────────────────────────────────
 
 /// Bounded frame channel depth for the HD capture stream. Small on purpose:
@@ -691,6 +792,8 @@ impl HdCaptureStream {
 ///
 /// This blocks briefly while ScreenCaptureKit starts the stream; call it from a
 /// blocking context (e.g. `spawn_blocking`).
+///
+/// Prefer [`start_hd_capture_buffers`] for zero-copy VideoToolbox encoding.
 pub fn start_hd_capture(
     monitor_id: u32,
     width: u32,
@@ -715,11 +818,56 @@ pub fn start_hd_capture(
         height,
         clamped_fps as i32,
         excluded_window_ids,
-        Some(tx), // push mode — every frame to the channel
+        FrameDelivery::PushRgba(tx),
     )?;
 
     info!(
         "HD capture stream started for display {} ({}x{} @ {}fps)",
+        monitor_id, width, height, clamped_fps
+    );
+
+    Ok((
+        HdCaptureStream {
+            _inner: stream,
+            monitor_id,
+            fps: clamped_fps,
+        },
+        rx,
+    ))
+}
+
+/// Like [`start_hd_capture`], but delivers retained [`CapturedSample`]s
+/// (`CMSampleBuffer`) so the consumer can feed VideoToolbox / AVAssetWriter
+/// without a CPU RGBA round-trip.
+pub fn start_hd_capture_buffers(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+    excluded_window_ids: &[u32],
+) -> XCapResult<(HdCaptureStream, tokio::sync::mpsc::Receiver<CapturedSample>)> {
+    let clamped_fps = fps.clamp(1, HD_MAX_FPS);
+    let (tx, rx) = tokio::sync::mpsc::channel(HD_CHANNEL_CAPACITY);
+
+    let content = get_shareable_content()?;
+    let displays = content.displays();
+    let sc_display = displays
+        .iter()
+        .find(|d| d.display_id().0 == monitor_id)
+        .ok_or_else(|| XCapError::monitor_not_found(monitor_id))?;
+
+    let stream = MonitorStream::new(
+        sc_display,
+        &content,
+        width,
+        height,
+        clamped_fps as i32,
+        excluded_window_ids,
+        FrameDelivery::PushSample(tx),
+    )?;
+
+    info!(
+        "HD buffer capture stream started for display {} ({}x{} @ {}fps)",
         monitor_id, width, height, clamped_fps
     );
 

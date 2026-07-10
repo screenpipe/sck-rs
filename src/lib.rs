@@ -39,17 +39,20 @@
 
 mod capture;
 mod error;
+mod frame;
 mod monitor;
 mod stream_manager;
 mod window;
 
 pub use capture::invalidate_shareable_content_cache;
 pub use error::{XCapError, XCapResult};
+pub use frame::{CapturedPixelBuffer, CapturedSample};
 pub use monitor::Monitor;
 pub use stream_manager::{
     capture_monitor_persistent, invalidate_monitor_stream, monitor_frame_seq,
-    peek_latest_frame, peek_latest_frame_matching, start_hd_capture, stop_all_streams,
-    HdCaptureStream,
+    peek_latest_frame, peek_latest_frame_matching, peek_latest_pixel_buffer,
+    peek_latest_pixel_buffer_matching, start_hd_capture, start_hd_capture_buffers,
+    stop_all_streams, HdCaptureStream,
 };
 pub use window::Window;
 
