@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use sck_rs::{peek_latest_frame, stop_all_streams, Monitor};
+use sck_rs::{peek_latest_frame, start_hd_capture, stop_all_streams, Monitor};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -106,6 +106,27 @@ fn invalidate_and_peek_stay_responsive_under_real_sck_churn() {
                 .expect("recreate stream and update exclusion state")
         };
         assert!(frame.width() > 0 && frame.height() > 0);
+
+        // HdCaptureStream owns a MonitorStream outside the global persistent
+        // stream map. Exercise that destructor too so the asynchronous stop
+        // path is covered for both capture modes used by screenpipe.
+        if cycle % 10 == 0 {
+            let (hd_stream, _hd_frames) = start_hd_capture(
+                monitor.id(),
+                (monitor.raw_width() / 4).clamp(160, 640),
+                (monitor.raw_height() / 4).clamp(90, 360),
+                5,
+                &[],
+            )
+            .expect("start dedicated HD stream");
+            let hd_drop_started = Instant::now();
+            drop(hd_stream);
+            assert!(
+                hd_drop_started.elapsed() <= MAX_CONTROL_LATENCY,
+                "cycle {cycle}: HD stream teardown blocked for {:?}",
+                hd_drop_started.elapsed()
+            );
+        }
 
         if cycle % 5 == 4 {
             let stop_all_started = Instant::now();
