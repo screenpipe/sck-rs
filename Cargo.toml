@@ -18,7 +18,7 @@ image = "0.25"
 
 # Apple frameworks bindings (pure Rust, no Swift)
 # Using upstream cidre - includes SCContentFilter initializers from PR #51
-cidre = { git = "https://github.com/yury/cidre.git", rev = "8481f3f0dc7dd39bb5be80d9424bfac0cad3801a", features = ["sc", "cg", "cv", "cm", "dispatch", "blocks", "async"] }
+cidre = { git = "https://github.com/yury/cidre.git", features = ["sc", "cg", "cv", "cm", "dispatch", "blocks", "async"] }
 
 # Error handling
 thiserror = "1.0"
