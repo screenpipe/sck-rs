@@ -17,7 +17,8 @@ use cidre::{
 use image::RgbaImage;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -101,6 +102,62 @@ impl OutputImpl for FrameReceiver {
         inner.frame_notify.notify_waiters();
     }
 }
+
+// A ScreenCaptureKit stop completion is normally prompt, but macOS can fail to
+// deliver it after a capture callback wedges. Keep stop asynchronous so a
+// missing completion can never block capture recovery or the app's main
+// thread. The cap prevents repeated OS failures from retaining an unbounded
+// number of streams/completion blocks.
+const MAX_PENDING_STREAM_STOPS: usize = 8;
+
+struct StopLimiter {
+    pending: AtomicUsize,
+    max: usize,
+}
+
+impl StopLimiter {
+    const fn new(max: usize) -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<PendingStopSlot<'_>> {
+        let mut current = self.pending.load(Ordering::Acquire);
+        loop {
+            if current >= self.max {
+                return None;
+            }
+            match self.pending.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(PendingStopSlot { limiter: self }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+}
+
+struct PendingStopSlot<'a> {
+    limiter: &'a StopLimiter,
+}
+
+impl Drop for PendingStopSlot<'_> {
+    fn drop(&mut self) {
+        self.limiter.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+static STREAM_STOP_LIMITER: StopLimiter = StopLimiter::new(MAX_PENDING_STREAM_STOPS);
 
 // ── Per-monitor stream ─────────────────────────────────────────────
 
@@ -215,12 +272,8 @@ impl MonitorStream {
         crate::capture::run_in_thread(move || {
             crate::capture::block_on(async { stream.update_content_filter(&filter).await })
         })
-        .map_err(|e| {
-            XCapError::capture_failed(format!("failed to update content filter: {}", e))
-        })?
-        .map_err(|e| {
-            XCapError::capture_failed(format!("update content filter error: {:?}", e))
-        })?;
+        .map_err(|e| XCapError::capture_failed(format!("failed to update content filter: {}", e)))?
+        .map_err(|e| XCapError::capture_failed(format!("update content filter error: {:?}", e)))?;
 
         let mut sorted = new_ids.to_vec();
         sorted.sort_unstable();
@@ -268,12 +321,34 @@ impl MonitorStream {
 
 impl Drop for MonitorStream {
     fn drop(&mut self) {
-        debug!("stopping persistent SCK stream");
+        let Some(stop_slot) = STREAM_STOP_LIMITER.try_acquire() else {
+            // Dropping the final SCStream handle is the only bounded fallback
+            // once macOS has already stranded too many stop completions.
+            warn!(
+                "too many pending SCK stream stops; releasing stream without waiting for completion"
+            );
+            return;
+        };
+
+        debug!("requesting asynchronous persistent SCK stream stop");
         let stream = self._stream.retained();
-        let _ = crate::capture::run_in_thread(move || {
-            crate::capture::block_on(async {
-                let _ = stream.stop().await;
-            })
+        let mut keep_stream_alive = Some(stream.retained());
+        let mut keep_output_alive = Some(self._output.retained());
+        let mut keep_queue_alive = Some(self._queue.retained());
+        let mut stop_slot = Some(stop_slot);
+        stream.stop_with_ch(move |error| {
+            if let Some(error) = error {
+                warn!("persistent SCK stream stop failed: {:?}", error);
+            } else {
+                debug!("persistent SCK stream stopped");
+            }
+
+            // The callback can legally be invoked only once, but use Options
+            // so an unexpected duplicate callback remains harmless.
+            let _ = keep_queue_alive.take();
+            let _ = keep_output_alive.take();
+            let _ = keep_stream_alive.take();
+            let _ = stop_slot.take();
         });
     }
 }
@@ -321,6 +396,18 @@ static MANAGER: Lazy<StreamManager> = Lazy::new(|| StreamManager {
     streams: Mutex::new(HashMap::new()),
 });
 
+fn remove_entry<K, V>(entries: &Mutex<HashMap<K, V>>, key: &K) -> Option<V>
+where
+    K: Eq + Hash,
+{
+    entries.lock().ok()?.remove(key)
+}
+
+fn take_entries<K, V>(entries: &Mutex<HashMap<K, V>>) -> Option<HashMap<K, V>> {
+    let mut entries = entries.lock().ok()?;
+    Some(std::mem::take(&mut *entries))
+}
+
 impl StreamManager {
     /// Get the latest frame for a monitor, creating the stream if needed.
     ///
@@ -367,9 +454,8 @@ impl StreamManager {
                     // Exclusions changed — update filter in-place
                     let content = get_shareable_content()?;
                     let displays = content.displays();
-                    if let Some(sc_display) = displays
-                        .iter()
-                        .find(|d| d.display_id().0 == monitor_id)
+                    if let Some(sc_display) =
+                        displays.iter().find(|d| d.display_id().0 == monitor_id)
                     {
                         match ms.update_exclusions(excluded_window_ids, sc_display, &content) {
                             Ok(()) => {
@@ -498,21 +584,26 @@ impl StreamManager {
 
     /// Stop and remove a specific monitor stream.
     pub fn invalidate(monitor_id: u32) {
-        if let Ok(mut streams) = MANAGER.streams.lock() {
-            if streams.remove(&monitor_id).is_some() {
-                info!("invalidated persistent stream for display {}", monitor_id);
-            }
+        // Keep the removed value alive until after the mutex guard is gone.
+        // Its destructor initiates ScreenCaptureKit teardown and must never run
+        // while readers such as the tray preview are excluded from the map.
+        let removed = remove_entry(&MANAGER.streams, &monitor_id);
+        let had_stream = removed.is_some();
+        drop(removed);
+        if had_stream {
+            info!("invalidated persistent stream for display {}", monitor_id);
         }
     }
 
     /// Stop all streams (for clean shutdown or DRM pause).
     pub fn stop_all() {
-        if let Ok(mut streams) = MANAGER.streams.lock() {
-            let count = streams.len();
-            streams.clear();
-            if count > 0 {
-                info!("stopped {} persistent stream(s)", count);
-            }
+        // Move the map out atomically, then run every destructor after the
+        // global lock has been released.
+        let streams = take_entries(&MANAGER.streams).unwrap_or_default();
+        let count = streams.len();
+        drop(streams);
+        if count > 0 {
+            info!("stopped {} persistent stream(s)", count);
         }
     }
 }
@@ -573,7 +664,7 @@ pub fn monitor_frame_seq(monitor_id: u32) -> Option<u64> {
 pub fn peek_latest_frame(monitor_id: u32) -> Option<RgbaImage> {
     MANAGER
         .streams
-        .lock()
+        .try_lock()
         .ok()?
         .get(&monitor_id)
         .and_then(|ms| ms.latest_frame())
@@ -664,4 +755,156 @@ pub fn start_hd_capture(
         },
         rx,
     ))
+}
+
+#[cfg(test)]
+mod stream_manager_regression_tests {
+    use super::*;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct BlockingDrop {
+        entered: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn peek_latest_frame_does_not_wait_for_manager_lock() {
+        let _manager_guard = MANAGER.streams.lock().expect("manager lock");
+        let started = Instant::now();
+
+        assert!(peek_latest_frame(u32::MAX).is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "peek_latest_frame must be non-blocking while capture teardown owns the manager lock"
+        );
+    }
+
+    #[test]
+    fn removed_entry_is_dropped_after_its_map_lock_is_released() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let entries = Arc::new(Mutex::new(HashMap::from([(
+            7_u32,
+            BlockingDrop {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        )])));
+        let worker_entries = Arc::clone(&entries);
+
+        let worker = thread::spawn(move || {
+            let removed = remove_entry(&worker_entries, &7);
+            drop(removed);
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("removed value should begin dropping");
+        assert!(
+            entries.try_lock().is_ok(),
+            "map lock must be available while a removed value's destructor is blocked"
+        );
+        release_tx.send(()).expect("release blocking drop");
+        worker.join().expect("drop worker");
+    }
+
+    #[test]
+    fn drained_entries_are_dropped_after_their_map_lock_is_released() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let entries = Arc::new(Mutex::new(HashMap::from([(
+            11_u32,
+            BlockingDrop {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        )])));
+        let worker_entries = Arc::clone(&entries);
+
+        let worker = thread::spawn(move || {
+            let drained = take_entries(&worker_entries).expect("drain map");
+            drop(drained);
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drained value should begin dropping");
+        assert!(
+            entries.try_lock().is_ok(),
+            "map lock must be available while drained values are being destroyed"
+        );
+        release_tx.send(()).expect("release blocking drop");
+        worker.join().expect("drop worker");
+    }
+
+    #[test]
+    fn pending_stop_limiter_caps_and_releases_slots() {
+        let limiter = StopLimiter::new(2);
+        let first = limiter.try_acquire().expect("first stop slot");
+        let second = limiter.try_acquire().expect("second stop slot");
+
+        assert_eq!(limiter.pending(), 2);
+        assert!(limiter.try_acquire().is_none());
+
+        drop(first);
+        assert_eq!(limiter.pending(), 1);
+        let replacement = limiter.try_acquire().expect("released slot is reusable");
+        assert_eq!(limiter.pending(), 2);
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(limiter.pending(), 0);
+    }
+
+    #[test]
+    fn pending_stop_limiter_is_race_safe() {
+        const THREADS: usize = 32;
+        const LIMIT: usize = 4;
+
+        let limiter = Arc::new(StopLimiter::new(LIMIT));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let limiter = Arc::clone(&limiter);
+                let barrier = Arc::clone(&barrier);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                let rejected = Arc::clone(&rejected);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let Some(slot) = limiter.try_acquire() else {
+                        rejected.fetch_add(1, Ordering::AcqRel);
+                        return;
+                    };
+                    let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    max_active.fetch_max(current, Ordering::AcqRel);
+                    thread::sleep(Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    drop(slot);
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            worker.join().expect("stop limiter worker");
+        }
+
+        assert!(max_active.load(Ordering::Acquire) <= LIMIT);
+        assert!(rejected.load(Ordering::Acquire) > 0);
+        assert_eq!(limiter.pending(), 0);
+    }
 }
