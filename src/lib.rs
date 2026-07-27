@@ -42,8 +42,8 @@ mod window;
 pub use error::{XCapError, XCapResult};
 pub use monitor::Monitor;
 pub use stream_manager::{
-    capture_monitor_persistent, invalidate_monitor_stream, monitor_frame_seq,
-    peek_latest_frame, start_hd_capture, stop_all_streams, HdCaptureStream,
+    capture_monitor_persistent, invalidate_monitor_stream, monitor_frame_seq, peek_latest_frame,
+    start_hd_capture, stop_all_streams, HdCaptureStream,
 };
 pub use window::Window;
 

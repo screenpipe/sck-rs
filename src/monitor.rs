@@ -198,7 +198,12 @@ impl Monitor {
     /// (zero overhead, pixel-perfect). Use this to hide sensitive apps
     /// (password managers, banking apps, etc.) from stored frames.
     pub fn capture_image_excluding(&self, excluded_window_ids: &[u32]) -> XCapResult<RgbaImage> {
-        capture::capture_monitor_sync(self.display_id, self.width, self.height, excluded_window_ids)
+        capture::capture_monitor_sync(
+            self.display_id,
+            self.width,
+            self.height,
+            excluded_window_ids,
+        )
     }
 
     /// Capture an image of the monitor, downscaled at the source.
