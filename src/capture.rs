@@ -25,18 +25,68 @@ pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     RUNTIME.block_on(f)
 }
 
-/// Run a sync closure in a separate thread to avoid nested runtime issues
+/// Upper bound on threads left wedged inside a ScreenCaptureKit call whose
+/// completion handler never fired. Once this many are stuck, `run_bounded`
+/// fails fast instead of leaking another thread — the daemon is unresponsive
+/// and piling on more requests only makes recovery slower.
+const MAX_WEDGED_SCK_CALLS: usize = 4;
+
+/// Live count of `run_bounded` worker threads that outlived their deadline
+/// and have not completed yet. Decremented by the worker when the wedged OS
+/// call eventually returns (or never, if it doesn't).
+static WEDGED_SCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Run a closure that wraps a ScreenCaptureKit call on a worker thread and
+/// wait for it at most `timeout`.
 ///
-/// If the spawned thread panics, this returns an error instead of propagating
-/// the panic to the calling thread (which would cause abort via panic_cannot_unwind).
-pub(crate) fn run_in_thread<F, T>(f: F) -> XCapResult<T>
+/// ScreenCaptureKit completion handlers (`SCShareableContent`,
+/// `SCStream.startCapture`, `updateContentFilter`) can silently never fire —
+/// observed in production as threads parked forever in `pthread_join` under
+/// `fetch_shareable_content`, freezing every capture path in the process. An
+/// unbounded `join` there turns one wedged daemon callback into a total
+/// capture outage, so every SCK call goes through this bounded wait instead.
+///
+/// On timeout the worker thread is intentionally leaked (there is no safe way
+/// to cancel a blocked ObjC completion wait); `WEDGED_SCK_CALLS` caps how many
+/// can pile up before callers fail fast.
+pub(crate) fn run_bounded<F, T>(
+    name: &'static str,
+    timeout: std::time::Duration,
+    f: F,
+) -> XCapResult<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    match std::thread::spawn(f).join() {
-        Ok(result) => Ok(result),
-        Err(panic_info) => {
+    use std::sync::atomic::Ordering;
+
+    if WEDGED_SCK_CALLS.load(Ordering::Acquire) >= MAX_WEDGED_SCK_CALLS {
+        return Err(XCapError::capture_failed(format!(
+            "{name}: skipped — {MAX_WEDGED_SCK_CALLS} ScreenCaptureKit calls already wedged; daemon unresponsive"
+        )));
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("sck-{name}"))
+        .spawn(move || {
+            let result = panic::catch_unwind(panic::AssertUnwindSafe(f));
+            // If the receiver gave up (timeout), this send fails and the
+            // wedged-count decrement below is the only remaining effect.
+            let timed_out = tx.send(result).is_err();
+            if timed_out {
+                WEDGED_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
+            }
+        });
+    if let Err(e) = spawn_result {
+        return Err(XCapError::capture_failed(format!(
+            "{name}: failed to spawn worker thread: {e}"
+        )));
+    }
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(panic_info)) => {
             let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
                 format!("Thread panicked: {}", s)
             } else if let Some(s) = panic_info.downcast_ref::<String>() {
@@ -46,8 +96,25 @@ where
             };
             Err(XCapError::capture_failed(msg))
         }
+        Err(_) => {
+            // Worker still blocked in the OS call. Count it as wedged; the
+            // worker decrements when (if) it ever completes.
+            WEDGED_SCK_CALLS.fetch_add(1, Ordering::AcqRel);
+            tracing::warn!(
+                "{name}: ScreenCaptureKit call did not complete within {:?} — abandoning worker ({} wedged)",
+                timeout,
+                WEDGED_SCK_CALLS.load(Ordering::Acquire)
+            );
+            Err(XCapError::capture_failed(format!(
+                "{name}: timed out after {timeout:?} waiting for ScreenCaptureKit"
+            )))
+        }
     }
 }
+
+/// Bound on a single `SCShareableContent` fetch. Long enough for a busy
+/// WindowServer, short enough that a wedged daemon can't freeze callers.
+pub(crate) const SHAREABLE_CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 // CoreGraphics FFI for display enumeration fallback
 extern "C" {
@@ -69,9 +136,13 @@ fn cg_online_display_count() -> u32 {
     }
 }
 
-/// Fetch SCShareableContent once
+/// Fetch SCShareableContent once, bounded by `SHAREABLE_CONTENT_TIMEOUT`.
+///
+/// Always runs on a worker thread: `block_on` must not run inside an existing
+/// tokio runtime, and the bounded wait needs the caller decoupled from the OS
+/// call so a never-firing completion handler can't park the caller forever.
 fn fetch_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
-    let fetch = || {
+    run_bounded("shareable-content", SHAREABLE_CONTENT_TIMEOUT, || {
         block_on(async {
             sc::ShareableContent::current().await.map_err(|e| {
                 let err_str = format!("{:?}", e);
@@ -88,13 +159,7 @@ fn fetch_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> 
                 }
             })
         })
-    };
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        run_in_thread(fetch)?
-    } else {
-        fetch()
-    }
+    })?
 }
 
 /// Get shareable content synchronously.
@@ -280,12 +345,13 @@ pub(crate) fn safe_image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult
 /// This captures the display containing the window and crops to the window bounds.
 /// This approach works reliably for all window types.
 pub fn capture_window_sync(window_id: u32, width: u32, height: u32) -> XCapResult<RgbaImage> {
-    // If we're in a tokio runtime, run in a separate thread to avoid nested runtime panic
-    if tokio::runtime::Handle::try_current().is_ok() {
-        run_in_thread(move || block_on(capture_window_async(window_id, width, height)))?
-    } else {
-        block_on(capture_window_async(window_id, width, height))
-    }
+    // Always bounded on a worker thread: safe inside a tokio runtime (no
+    // nested block_on) and immune to SCK completion handlers that never fire.
+    run_bounded(
+        "window-capture",
+        std::time::Duration::from_secs(10),
+        move || block_on(capture_window_async(window_id, width, height)),
+    )?
 }
 
 /// Async version of window capture
@@ -438,12 +504,16 @@ pub fn capture_monitor_sync(
     excluded_window_ids: &[u32],
 ) -> XCapResult<RgbaImage> {
     let ids = excluded_window_ids.to_vec();
-    // If we're in a tokio runtime, run in a separate thread to avoid nested runtime panic
-    if tokio::runtime::Handle::try_current().is_ok() {
-        run_in_thread(move || block_on(capture_monitor_async(monitor_id, width, height, &ids)))?
-    } else {
-        block_on(capture_monitor_async(monitor_id, width, height, &ids))
-    }
+    // Always bounded on a worker thread: safe inside a tokio runtime (no
+    // nested block_on) and immune to SCK completion handlers that never fire.
+    // 30s exceeds the worst-case sum of the bounded steps inside
+    // (content fetch 5s + stream start 10s + filter update 5s + first-frame
+    // wait 3s) so this outer bound only trips when something is truly stuck.
+    run_bounded(
+        "monitor-capture",
+        std::time::Duration::from_secs(30),
+        move || block_on(capture_monitor_async(monitor_id, width, height, &ids)),
+    )?
 }
 
 /// Async version of monitor capture.
@@ -545,6 +615,76 @@ async fn capture_monitor_oneshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `run_bounded` tests share the process-global `WEDGED_SCK_CALLS`
+    /// counter, so they must not run concurrently with each other.
+    static RUN_BOUNDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn run_bounded_returns_value_on_completion() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let result = run_bounded("test-ok", std::time::Duration::from_secs(5), || 42u32);
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn run_bounded_times_out_on_stuck_closure() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let start = std::time::Instant::now();
+        let result = run_bounded("test-stuck", std::time::Duration::from_millis(100), || {
+            // Simulate an SCK completion handler that never fires. Bounded
+            // sleep (not park) so the leaked worker exits after the test.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            1u32
+        });
+        assert!(result.is_err(), "stuck closure must time out");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "caller must return promptly at the deadline, not wait for the closure"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("timed out"), "unexpected error: {msg}");
+        // Wedged-count bookkeeping: one slot taken at timeout, released when
+        // the late worker completes. Compared against a baseline snapshot so
+        // unrelated tests exercising live SCK calls can't skew the assertion.
+        let after_timeout = WEDGED_SCK_CALLS.load(std::sync::atomic::Ordering::Acquire);
+        assert!(after_timeout >= 1, "timeout must register a wedged worker");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let after_completion = WEDGED_SCK_CALLS.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            after_completion < after_timeout,
+            "late-completing worker must clear its wedged slot ({after_timeout} -> {after_completion})"
+        );
+    }
+
+    #[test]
+    fn run_bounded_surfaces_panics_as_errors() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let result = run_bounded("test-panic", std::time::Duration::from_secs(5), || {
+            panic!("boom");
+        });
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("boom"),
+            "panic payload must be surfaced: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_bounded_fails_fast_once_wedge_cap_reached() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        // Simulate MAX_WEDGED_SCK_CALLS abandoned workers.
+        WEDGED_SCK_CALLS.store(MAX_WEDGED_SCK_CALLS, Ordering::Release);
+        let start = std::time::Instant::now();
+        let result = run_bounded("test-capped", std::time::Duration::from_secs(5), || 1u32);
+        WEDGED_SCK_CALLS.store(0, Ordering::Release);
+        assert!(result.is_err(), "must fail fast at the wedge cap");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "capped call must not spawn a worker or wait"
+        );
+    }
 
     #[test]
     fn test_get_shareable_content() {

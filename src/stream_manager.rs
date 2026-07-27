@@ -161,6 +161,9 @@ static STREAM_STOP_LIMITER: StopLimiter = StopLimiter::new(MAX_PENDING_STREAM_ST
 
 // ── Per-monitor stream ─────────────────────────────────────────────
 
+/// Monotonic id source for `MonitorStream::generation`.
+static STREAM_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 struct MonitorStream {
     _stream: arc::R<sc::Stream>,
     _output: arc::R<FrameReceiver>,
@@ -173,6 +176,10 @@ struct MonitorStream {
     height: u32,
     /// Sorted SCK window IDs currently excluded from this stream's ContentFilter.
     excluded_window_ids: Vec<u32>,
+    /// Identity token: exclusion updates are applied outside the map lock, so
+    /// the updater re-checks under the lock that the entry it fetched content
+    /// for is still the same stream before committing bookkeeping.
+    generation: u64,
 }
 
 impl MonitorStream {
@@ -226,9 +233,12 @@ impl MonitorStream {
                 XCapError::capture_failed(format!("failed to add stream output: {:?}", e))
             })?;
 
-        // Start the stream
+        // Start the stream. Bounded: SCStream.startCapture's completion
+        // handler can silently never fire on a wedged SCK daemon, and an
+        // unbounded join here would freeze the caller (and, transitively,
+        // every capture path waiting on the stream map).
         let stream_clone = stream.retained();
-        crate::capture::run_in_thread(move || {
+        crate::capture::run_bounded("stream-start", Duration::from_secs(10), move || {
             crate::capture::block_on(async { stream_clone.start().await })
         })
         .map_err(|e| XCapError::capture_failed(format!("failed to start stream: {}", e)))?
@@ -256,35 +266,25 @@ impl MonitorStream {
             width,
             height,
             excluded_window_ids: sorted_ids,
+            generation: STREAM_GENERATION.fetch_add(1, Ordering::Relaxed),
         })
     }
 
-    /// Update the exclusion filter on a running stream without recreating it.
-    fn update_exclusions(
-        &mut self,
-        new_ids: &[u32],
-        sc_display: &sc::Display,
-        content: &sc::ShareableContent,
+    /// Push a new ContentFilter to a running stream, bounded.
+    ///
+    /// Standalone (no `&self`) so `StreamManager::capture` can run it after
+    /// releasing the stream-map lock — `updateContentFilter`'s completion can
+    /// wedge exactly like the other SCK callbacks, and holding the map lock
+    /// across it froze every capture path in the process.
+    fn apply_content_filter(
+        stream: arc::R<sc::Stream>,
+        filter: arc::R<sc::ContentFilter>,
     ) -> XCapResult<()> {
-        let filter = build_exclusion_filter(sc_display, content, new_ids);
-
-        let stream = self._stream.retained();
-        crate::capture::run_in_thread(move || {
+        crate::capture::run_bounded("filter-update", Duration::from_secs(5), move || {
             crate::capture::block_on(async { stream.update_content_filter(&filter).await })
         })
         .map_err(|e| XCapError::capture_failed(format!("failed to update content filter: {}", e)))?
-        .map_err(|e| XCapError::capture_failed(format!("update content filter error: {:?}", e)))?;
-
-        let mut sorted = new_ids.to_vec();
-        sorted.sort_unstable();
-        self.excluded_window_ids = sorted;
-
-        debug!(
-            "updated exclusion filter in-place ({} excluded)",
-            new_ids.len()
-        );
-
-        Ok(())
+        .map_err(|e| XCapError::capture_failed(format!("update content filter error: {:?}", e)))
     }
 
     fn latest_frame(&self) -> Option<RgbaImage> {
@@ -295,27 +295,6 @@ impl MonitorStream {
     /// `FrameReceiverInner::frame_seq`.
     fn frame_seq(&self) -> u64 {
         self.frame_seq.load(Ordering::Acquire)
-    }
-
-    async fn wait_first_frame(&self, timeout: Duration) -> XCapResult<RgbaImage> {
-        tokio::select! {
-            _ = async {
-                loop {
-                    self.frame_notify.notified().await;
-                    if self.latest_frame.lock().ok().map(|g| g.is_some()).unwrap_or(false) {
-                        break;
-                    }
-                }
-            } => {},
-            _ = tokio::time::sleep(timeout) => {
-                return Err(XCapError::capture_failed(
-                    "timeout waiting for first stream frame"
-                ));
-            }
-        }
-
-        self.latest_frame()
-            .ok_or_else(|| XCapError::capture_failed("no frame after notify"))
     }
 }
 
@@ -427,54 +406,151 @@ impl StreamManager {
         let mut sorted_input = excluded_window_ids.to_vec();
         sorted_input.sort_unstable();
 
-        // Fast path: stream exists, matches params, and has a frame
-        {
-            let mut streams = MANAGER
+        // Phase 1 — classify under the lock, cloning only cheap handles.
+        //
+        // No ScreenCaptureKit call may run while the map lock is held: SCK
+        // completion handlers can silently never fire, and a wedged call
+        // holding this lock freezes every capture path in the process
+        // (observed in production as the desktop capture loop going silent
+        // whenever the window-exclusion set changed on an unresponsive
+        // daemon).
+        enum Plan {
+            /// No usable stream — create or recreate below.
+            Create,
+            /// Stream matches but has no frame latched yet.
+            Wait(Arc<tokio::sync::Notify>, Arc<Mutex<Option<RgbaImage>>>),
+            /// Stream matches and a frame is latched.
+            Done(RgbaImage),
+            /// Exclusion set changed — push a new filter outside the lock.
+            UpdateFilter {
+                stream: arc::R<sc::Stream>,
+                generation: u64,
+                fallback_frame: Option<RgbaImage>,
+                /// True when the new set excludes windows the current filter
+                /// does not — serving frames without them could leak content
+                /// the caller asked to hide, so failures must fail closed.
+                exclusions_added: bool,
+            },
+        }
+
+        let plan = {
+            let streams = MANAGER
                 .streams
                 .lock()
                 .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
-            if let Some(ms) = streams.get_mut(&monitor_id) {
-                if ms.width != width || ms.height != height {
+            match streams.get(&monitor_id) {
+                None => Plan::Create,
+                Some(ms) if ms.width != width || ms.height != height => {
                     // Resolution changed — must fully recreate
                     debug!(
                         "resolution changed for display {}, recreating stream",
                         monitor_id
                     );
-                } else if ms.excluded_window_ids == sorted_input {
-                    // Exact match — return latest frame
-                    if let Some(frame) = ms.latest_frame() {
-                        return Ok(frame);
-                    }
-                    // Stream exists but no frame yet — wait below
-                    let notify = ms.frame_notify.clone();
-                    let latest = ms.latest_frame.clone();
-                    drop(streams);
-                    return Self::wait_for_frame(notify, latest).await;
-                } else {
-                    // Exclusions changed — update filter in-place
+                    Plan::Create
+                }
+                Some(ms) if ms.excluded_window_ids == sorted_input => match ms.latest_frame() {
+                    Some(frame) => Plan::Done(frame),
+                    None => Plan::Wait(ms.frame_notify.clone(), ms.latest_frame.clone()),
+                },
+                Some(ms) => Plan::UpdateFilter {
+                    stream: ms._stream.retained(),
+                    generation: ms.generation,
+                    fallback_frame: ms.latest_frame(),
+                    exclusions_added: sorted_input
+                        .iter()
+                        .any(|id| !ms.excluded_window_ids.contains(id)),
+                },
+            }
+        };
+
+        match plan {
+            Plan::Done(frame) => return Ok(frame),
+            Plan::Wait(notify, latest) => return Self::wait_for_frame(notify, latest).await,
+            Plan::Create => {}
+            Plan::UpdateFilter {
+                stream,
+                generation,
+                fallback_frame,
+                exclusions_added,
+            } => {
+                // Phase 2 — all SCK work outside the lock, bounded.
+                let update_result = (|| -> XCapResult<()> {
                     let content = get_shareable_content()?;
                     let displays = content.displays();
-                    if let Some(sc_display) =
-                        displays.iter().find(|d| d.display_id().0 == monitor_id)
-                    {
-                        match ms.update_exclusions(excluded_window_ids, sc_display, &content) {
-                            Ok(()) => {
-                                if let Some(frame) = ms.latest_frame() {
-                                    return Ok(frame);
-                                }
-                                let notify = ms.frame_notify.clone();
-                                let latest = ms.latest_frame.clone();
-                                drop(streams);
-                                return Self::wait_for_frame(notify, latest).await;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "failed to update filter in-place for display {}: {}, recreating",
-                                    monitor_id, e
-                                );
-                                // Fall through to full recreation
-                            }
+                    let sc_display = displays
+                        .iter()
+                        .find(|d| d.display_id().0 == monitor_id)
+                        .ok_or_else(|| XCapError::monitor_not_found(monitor_id))?;
+                    let filter = build_exclusion_filter(sc_display, &content, excluded_window_ids);
+                    MonitorStream::apply_content_filter(stream, filter)
+                })();
+
+                match update_result {
+                    Ok(()) => {
+                        // Phase 3 — commit bookkeeping iff the entry is still
+                        // the same stream we pushed the filter to. Guard scope
+                        // ends before any await (clippy: await_holding_lock).
+                        enum Commit {
+                            Frame(RgbaImage),
+                            Wait(Arc<tokio::sync::Notify>, Arc<Mutex<Option<RgbaImage>>>),
+                            StreamChanged,
                         }
+                        let commit = {
+                            let mut streams = MANAGER.streams.lock().map_err(|_| {
+                                XCapError::capture_failed("stream manager lock poisoned")
+                            })?;
+                            match streams.get_mut(&monitor_id) {
+                                Some(ms) if ms.generation == generation => {
+                                    ms.excluded_window_ids = sorted_input.clone();
+                                    debug!(
+                                        "updated exclusion filter in-place ({} excluded)",
+                                        sorted_input.len()
+                                    );
+                                    match ms.latest_frame() {
+                                        Some(frame) => Commit::Frame(frame),
+                                        None => Commit::Wait(
+                                            ms.frame_notify.clone(),
+                                            ms.latest_frame.clone(),
+                                        ),
+                                    }
+                                }
+                                _ => Commit::StreamChanged,
+                            }
+                        };
+                        match commit {
+                            Commit::Frame(frame) => return Ok(frame),
+                            Commit::Wait(notify, latest) => {
+                                return Self::wait_for_frame(notify, latest).await
+                            }
+                            // The stream changed under us — fall through to
+                            // the create path, which re-validates params.
+                            Commit::StreamChanged => {}
+                        }
+                    }
+                    Err(e) if !exclusions_added => {
+                        // Exclusions were only REMOVED: the running (stricter)
+                        // filter over-excludes but never leaks. Serve the
+                        // latched frame instead of failing the capture because
+                        // SCK is momentarily unresponsive; the next capture
+                        // retries the update.
+                        warn!(
+                            "filter update failed for display {} ({}); serving frame with previous, stricter exclusions",
+                            monitor_id, e
+                        );
+                        if let Some(frame) = fallback_frame {
+                            return Ok(frame);
+                        }
+                        // No frame latched — fall through to recreation.
+                    }
+                    Err(e) => {
+                        // Newly-requested exclusions could NOT be applied —
+                        // fail closed: recreate with the new filter from
+                        // scratch rather than serving frames that may contain
+                        // a window the caller asked to hide.
+                        warn!(
+                            "filter update failed for display {} with new exclusions pending ({}); recreating stream",
+                            monitor_id, e
+                        );
                     }
                 }
             }
@@ -483,20 +559,22 @@ impl StreamManager {
         // Slow path: create or recreate stream
         Self::create_stream(monitor_id, width, height, excluded_window_ids)?;
 
-        // Wait for first frame
-        let streams = MANAGER
-            .streams
-            .lock()
-            .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
-        if let Some(ms) = streams.get(&monitor_id) {
-            let notify = ms.frame_notify.clone();
-            let latest = ms.latest_frame.clone();
-            drop(streams);
-            Self::wait_for_frame(notify, latest).await
-        } else {
-            Err(XCapError::capture_failed(
+        // Wait for first frame. Guard scope ends before the await
+        // (clippy: await_holding_lock).
+        let handles = {
+            let streams = MANAGER
+                .streams
+                .lock()
+                .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
+            streams
+                .get(&monitor_id)
+                .map(|ms| (ms.frame_notify.clone(), ms.latest_frame.clone()))
+        };
+        match handles {
+            Some((notify, latest)) => Self::wait_for_frame(notify, latest).await,
+            None => Err(XCapError::capture_failed(
                 "stream disappeared after creation",
-            ))
+            )),
         }
     }
 
@@ -538,29 +616,33 @@ impl StreamManager {
         height: u32,
         excluded_window_ids: &[u32],
     ) -> XCapResult<()> {
-        let mut streams = MANAGER
-            .streams
-            .lock()
-            .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
+        let mut sorted = excluded_window_ids.to_vec();
+        sorted.sort_unstable();
 
-        // Check again under lock
-        if let Some(existing) = streams.get(&monitor_id) {
-            let mut sorted = excluded_window_ids.to_vec();
-            sorted.sort_unstable();
-            if existing.width == width
-                && existing.height == height
-                && existing.excluded_window_ids == sorted
-            {
-                return Ok(());
+        // Idempotence check under the lock, then remove any stale entry.
+        // The removed stream's ScreenCaptureKit teardown runs after the
+        // guard is released (same rule as `invalidate`), and no SCK call
+        // ever runs while the map lock is held — a wedged completion here
+        // used to freeze every capture path in the process.
+        let removed = {
+            let mut streams = MANAGER
+                .streams
+                .lock()
+                .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
+            if let Some(existing) = streams.get(&monitor_id) {
+                if existing.width == width
+                    && existing.height == height
+                    && existing.excluded_window_ids == sorted
+                {
+                    return Ok(());
+                }
+                info!("recreating stream for display {}", monitor_id);
             }
-            info!(
-                "recreating stream for display {} (resolution change)",
-                monitor_id
-            );
-        }
-        streams.remove(&monitor_id);
+            streams.remove(&monitor_id)
+        };
+        drop(removed);
 
-        // Enumerate displays to find the target
+        // All ScreenCaptureKit work outside the lock, bounded.
         let content = get_shareable_content()?;
         let displays = content.displays();
         let sc_display = displays
@@ -577,7 +659,27 @@ impl StreamManager {
             excluded_window_ids,
             None, // latch mode — the persistent screenshot stream
         )?;
-        streams.insert(monitor_id, ms);
+
+        // Publish. If a concurrent creator raced us, keep whichever stream
+        // already matches the requested params; tear the loser down outside
+        // the lock.
+        let displaced = {
+            let mut streams = MANAGER
+                .streams
+                .lock()
+                .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
+            let equivalent_exists = streams.get(&monitor_id).is_some_and(|existing| {
+                existing.width == width
+                    && existing.height == height
+                    && existing.excluded_window_ids == sorted
+            });
+            if equivalent_exists {
+                Some(ms)
+            } else {
+                streams.insert(monitor_id, ms)
+            }
+        };
+        drop(displaced);
 
         Ok(())
     }
