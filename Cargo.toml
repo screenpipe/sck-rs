@@ -17,8 +17,11 @@ path = "src/lib.rs"
 image = "0.25"
 
 # Apple frameworks bindings (pure Rust, no Swift)
-# Using upstream cidre - includes SCContentFilter initializers from PR #51
-cidre = { git = "https://github.com/yury/cidre.git", features = ["sc", "cg", "cv", "cm", "dispatch", "blocks", "async"] }
+# Using upstream cidre - includes SCContentFilter initializers from PR #51.
+# Pinned: an unpinned git dep re-resolves to upstream HEAD on every consumer
+# `cargo update`, so different downstream lockfiles ended up compiling this
+# crate against different (untested) cidre versions. Bump deliberately.
+cidre = { git = "https://github.com/yury/cidre.git", rev = "9c20f5ee5abaad4598843a33e13d6e48822d1f30", features = ["sc", "cg", "cv", "cm", "dispatch", "blocks", "async"] }
 
 # Error handling
 thiserror = "1.0"

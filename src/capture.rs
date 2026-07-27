@@ -560,12 +560,15 @@ pub fn capture_monitor_sync(
     let ids = excluded_window_ids.to_vec();
     // Always bounded on a worker thread: safe inside a tokio runtime (no
     // nested block_on) and immune to SCK completion handlers that never fire.
-    // 30s exceeds the worst-case sum of the bounded steps inside
-    // (content fetch 5s + stream start 10s + filter update 5s + first-frame
-    // wait 3s) so this outer bound only trips when something is truly stuck.
+    // 60s exceeds the worst LEGITIMATE inner chain: get_shareable_content's
+    // post-wake retry ladder alone can take ~42s (up to 7 bounded 5s fetches
+    // plus ~6.7s of sleeps), and a failed filter update that falls through to
+    // recreation adds fetch 5s + start 10s + first-frame wait 3s. A tighter
+    // bound would false-trip right after wake and charge a wedged slot for a
+    // healthy-but-slow call.
     run_bounded(
         "monitor-capture",
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(60),
         move || block_on(capture_monitor_async(monitor_id, width, height, &ids)),
     )?
 }
