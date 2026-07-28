@@ -49,6 +49,19 @@ static WEDGED_SCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// On timeout the worker thread is intentionally leaked (there is no safe way
 /// to cancel a blocked ObjC completion wait); `WEDGED_SCK_CALLS` caps how many
 /// can pile up before callers fail fast.
+///
+/// Wedge accounting uses a per-call CAS handoff (`Pending` → `Completed` by
+/// the worker, `Pending` → `Abandoned` by the receiver) so exactly one side
+/// owns the outcome. The earlier send/recv-error protocol leaked a permanent
+/// wedged slot when the worker's send landed in the window between
+/// `recv_timeout` expiring and the receiver being dropped: the send succeeded
+/// (no decrement) while the receiver still incremented. Four such near-deadline
+/// completions would trip the fail-fast cap forever — turning the guard into a
+/// capture outage of its own.
+const WEDGE_PENDING: u8 = 0;
+const WEDGE_COMPLETED: u8 = 1;
+const WEDGE_ABANDONED: u8 = 2;
+
 pub(crate) fn run_bounded<F, T>(
     name: &'static str,
     timeout: std::time::Duration,
@@ -58,7 +71,8 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
 
     if WEDGED_SCK_CALLS.load(Ordering::Acquire) >= MAX_WEDGED_SCK_CALLS {
         return Err(XCapError::capture_failed(format!(
@@ -67,14 +81,26 @@ where
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
+    let state = Arc::new(AtomicU8::new(WEDGE_PENDING));
+    let worker_state = Arc::clone(&state);
     let spawn_result = std::thread::Builder::new()
         .name(format!("sck-{name}"))
         .spawn(move || {
             let result = panic::catch_unwind(panic::AssertUnwindSafe(f));
-            // If the receiver gave up (timeout), this send fails and the
-            // wedged-count decrement below is the only remaining effect.
-            let timed_out = tx.send(result).is_err();
-            if timed_out {
+            // Buffered send BEFORE the CAS: if the receiver observes
+            // `Completed`, the value is guaranteed to be in the channel.
+            let _ = tx.send(result);
+            if worker_state
+                .compare_exchange(
+                    WEDGE_PENDING,
+                    WEDGE_COMPLETED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                // Receiver already abandoned us and counted a wedged slot —
+                // we completed after all, so clear it.
                 WEDGED_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
             }
         });
@@ -84,30 +110,58 @@ where
         )));
     }
 
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(panic_info)) => {
-            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                format!("Thread panicked: {}", s)
-            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                format!("Thread panicked: {}", s)
-            } else {
-                "Thread panicked with unknown payload".to_string()
-            };
-            Err(XCapError::capture_failed(msg))
+    let unpack = |result: std::thread::Result<T>| -> XCapResult<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    format!("Thread panicked: {}", s)
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    format!("Thread panicked: {}", s)
+                } else {
+                    "Thread panicked with unknown payload".to_string()
+                };
+                Err(XCapError::capture_failed(msg))
+            }
         }
+    };
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => unpack(result),
         Err(_) => {
-            // Worker still blocked in the OS call. Count it as wedged; the
-            // worker decrements when (if) it ever completes.
-            WEDGED_SCK_CALLS.fetch_add(1, Ordering::AcqRel);
-            tracing::warn!(
-                "{name}: ScreenCaptureKit call did not complete within {:?} — abandoning worker ({} wedged)",
-                timeout,
-                WEDGED_SCK_CALLS.load(Ordering::Acquire)
-            );
-            Err(XCapError::capture_failed(format!(
-                "{name}: timed out after {timeout:?} waiting for ScreenCaptureKit"
-            )))
+            match state.compare_exchange(
+                WEDGE_PENDING,
+                WEDGE_ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // We own the abandonment: the worker is still inside the
+                    // OS call. Count the wedged slot; the worker's failed CAS
+                    // clears it if the call ever completes.
+                    WEDGED_SCK_CALLS.fetch_add(1, Ordering::AcqRel);
+                    tracing::warn!(
+                        "{name}: ScreenCaptureKit call did not complete within {:?} — abandoning worker ({} wedged)",
+                        timeout,
+                        WEDGED_SCK_CALLS.load(Ordering::Acquire)
+                    );
+                    Err(XCapError::capture_failed(format!(
+                        "{name}: timed out after {timeout:?} waiting for ScreenCaptureKit"
+                    )))
+                }
+                Err(_) => {
+                    // The worker completed a hair after the deadline and won
+                    // the CAS — its result is already buffered. Take it
+                    // instead of reporting a spurious timeout (and instead of
+                    // leaking a wedged slot that would never be cleared).
+                    match rx.try_recv() {
+                        Ok(result) => unpack(result),
+                        Err(_) => Err(XCapError::capture_failed(format!(
+                            "{name}: worker completed at the deadline but its result was lost"
+                        ))),
+                    }
+                }
+            }
         }
     }
 }
@@ -506,12 +560,15 @@ pub fn capture_monitor_sync(
     let ids = excluded_window_ids.to_vec();
     // Always bounded on a worker thread: safe inside a tokio runtime (no
     // nested block_on) and immune to SCK completion handlers that never fire.
-    // 30s exceeds the worst-case sum of the bounded steps inside
-    // (content fetch 5s + stream start 10s + filter update 5s + first-frame
-    // wait 3s) so this outer bound only trips when something is truly stuck.
+    // 60s exceeds the worst LEGITIMATE inner chain: get_shareable_content's
+    // post-wake retry ladder alone can take ~42s (up to 7 bounded 5s fetches
+    // plus ~6.7s of sleeps), and a failed filter update that falls through to
+    // recreation adds fetch 5s + start 10s + first-frame wait 3s. A tighter
+    // bound would false-trip right after wake and charge a wedged slot for a
+    // healthy-but-slow call.
     run_bounded(
         "monitor-capture",
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(60),
         move || block_on(capture_monitor_async(monitor_id, width, height, &ids)),
     )?
 }
@@ -625,6 +682,85 @@ mod tests {
         let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
         let result = run_bounded("test-ok", std::time::Duration::from_secs(5), || 42u32);
         assert_eq!(result.unwrap(), 42);
+    }
+
+    /// Regression for the wedge-accounting race: a worker completing right
+    /// around the deadline must never leak a permanent wedged slot (four
+    /// leaks would trip the fail-fast cap and kill all SCK capture until app
+    /// restart). Deterministic: the closure blocks until the test has
+    /// observed the timeout, so the abandon-then-complete interleaving is
+    /// forced; the worker's failed CAS must clear the slot it was counted in.
+    #[test]
+    fn run_bounded_late_completion_clears_its_wedged_slot() {
+        use std::sync::atomic::Ordering;
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+
+        let baseline = WEDGED_SCK_CALLS.load(Ordering::Acquire);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let result = run_bounded(
+            "test-late",
+            std::time::Duration::from_millis(50),
+            move || {
+                // Block until the receiver has timed out and abandoned us.
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                7u32
+            },
+        );
+        assert!(result.is_err(), "must report timeout while worker is held");
+        assert_eq!(
+            WEDGED_SCK_CALLS.load(Ordering::Acquire),
+            baseline + 1,
+            "abandoned worker must be counted"
+        );
+
+        // Let the worker complete; its failed CAS must clear the slot.
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while WEDGED_SCK_CALLS.load(Ordering::Acquire) != baseline {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "late-completing worker never cleared its wedged slot"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Hammer the near-deadline window: many workers finishing a few ms after
+    /// the timeout. Under the old send/recv-error protocol some of these
+    /// leaked permanent wedged slots; the CAS handoff must always drain back
+    /// to the baseline.
+    #[test]
+    fn run_bounded_near_deadline_completions_never_leak_wedged_slots() {
+        use std::sync::atomic::Ordering;
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+
+        let baseline = WEDGED_SCK_CALLS.load(Ordering::Acquire);
+        for i in 0..40 {
+            // Alternate just-under and just-over the deadline so both the
+            // in-time and late paths are exercised, including completions
+            // racing the timeout expiry itself.
+            let sleep_ms = if i % 2 == 0 { 8 } else { 12 };
+            let _ = run_bounded(
+                "test-near-deadline",
+                std::time::Duration::from_millis(10),
+                move || {
+                    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                    i
+                },
+            );
+        }
+        // Every worker sleeps ≤12ms, so all complete quickly; the count must
+        // return exactly to baseline — any residue is a leaked slot.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while WEDGED_SCK_CALLS.load(Ordering::Acquire) != baseline {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "near-deadline completions leaked wedged slots: {} != baseline {}",
+                WEDGED_SCK_CALLS.load(Ordering::Acquire),
+                baseline
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
