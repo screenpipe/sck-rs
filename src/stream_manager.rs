@@ -56,6 +56,10 @@ define_obj_type!(
 
 impl Output for FrameReceiver {}
 
+fn push_channel_accepts_frame(tx: &tokio::sync::mpsc::Sender<RgbaImage>) -> bool {
+    tx.capacity() > 0
+}
+
 #[objc::add_methods]
 impl OutputImpl for FrameReceiver {
     extern "C" fn impl_stream_did_output_sample_buf(
@@ -66,6 +70,20 @@ impl OutputImpl for FrameReceiver {
         kind: sc::OutputType,
     ) {
         if kind != sc::OutputType::Screen {
+            return;
+        }
+
+        // HD push mode is newest-frame-only. Check the bounded handoff before
+        // touching the pixel buffer: BGRA -> RGBA copies the entire display
+        // and is the dominant callback cost at meeting capture rates. When the
+        // encoder already has one frame waiting, converting another frame only
+        // to have try_send reject it wastes a full-frame copy.
+        if self
+            .inner_mut()
+            .frame_tx
+            .as_ref()
+            .is_some_and(|tx| !push_channel_accepts_frame(tx))
+        {
             return;
         }
 
@@ -821,10 +839,12 @@ pub fn peek_latest_frame(monitor_id: u32) -> Option<RgbaImage> {
 
 // ── High-FPS HD capture (push mode) ────────────────────────────────
 
-/// Bounded frame channel depth for the HD capture stream. Small on purpose:
-/// the recorder should consume in real time, so we'd rather drop the newest
-/// frame than let memory grow if it briefly stalls. 8 frames ≈ 0.8s at 10fps.
-const HD_CHANNEL_CAPACITY: usize = 8;
+/// Bounded frame channel depth for the HD capture stream. One queued frame is
+/// intentional: the recorder emits constant-rate video by repeating its last
+/// encoded frame, so a backlog cannot improve output quality. Keeping only one
+/// handoff also lets the callback skip full-frame BGRA -> RGBA conversion while
+/// the encoder is busy.
+const HD_CHANNEL_CAPACITY: usize = 1;
 
 /// Maximum HD capture rate we'll request from ScreenCaptureKit.
 const HD_MAX_FPS: u32 = 60;
@@ -913,6 +933,24 @@ mod stream_manager_regression_tests {
     use std::sync::Barrier;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn hd_push_channel_applies_backpressure_before_frame_conversion() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(push_channel_accepts_frame(&tx));
+
+        tx.try_send(RgbaImage::new(2, 2)).unwrap();
+        assert!(
+            !push_channel_accepts_frame(&tx),
+            "a queued frame must suppress another full-frame conversion"
+        );
+
+        let _ = rx.try_recv().unwrap();
+        assert!(
+            push_channel_accepts_frame(&tx),
+            "conversion can resume as soon as the recorder drains the handoff"
+        );
+    }
 
     struct BlockingDrop {
         entered: Sender<()>,
