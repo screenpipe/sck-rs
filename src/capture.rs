@@ -36,6 +36,38 @@ const MAX_WEDGED_SCK_CALLS: usize = 4;
 /// call eventually returns (or never, if it doesn't).
 static WEDGED_SCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Upper bound on worker threads inside a ScreenCaptureKit call at once,
+/// whether or not they have passed their deadline yet.
+///
+/// `MAX_WEDGED_SCK_CALLS` alone cannot bound leaked threads: it is only
+/// charged *after* a call misses its deadline, so a burst of callers that
+/// arrive together all observe zero wedged calls and all spawn. Every one of
+/// them then wedges. Bounding the leak requires admission control on calls
+/// that are still in flight, which is what this cap does.
+///
+/// Sized above the wedged cap so the fail-fast path stays the one that trips
+/// during a daemon outage, and above normal concurrency (screenpipe caps
+/// monitor enumeration at 2 and adds stream-start / filter-update /
+/// monitor-capture on top) so healthy bursts are never rejected.
+const MAX_LIVE_SCK_CALLS: usize = 6;
+
+/// Worker threads currently inside a ScreenCaptureKit call. Reserved before
+/// the thread is spawned and released by the worker when the OS call returns,
+/// so the count covers in-flight and wedged calls alike.
+static LIVE_SCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Atomically claim a live-call slot, or report the cap. A CAS loop rather
+/// than `load` + `fetch_add`: the load-then-act version is exactly the race
+/// this guard exists to close.
+fn try_reserve_live_call() -> Result<(), usize> {
+    use std::sync::atomic::Ordering;
+    LIVE_SCK_CALLS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+            (live < MAX_LIVE_SCK_CALLS).then_some(live + 1)
+        })
+        .map(|_| ())
+}
+
 /// Run a closure that wraps a ScreenCaptureKit call on a worker thread and
 /// wait for it at most `timeout`.
 ///
@@ -80,6 +112,16 @@ where
         )));
     }
 
+    // Reserved before the spawn, released by the worker. Without this the
+    // wedged check above is a check-then-act: it is only charged on timeout,
+    // so a simultaneous burst all reads the pre-burst count and every caller
+    // spawns a thread that goes on to wedge.
+    if try_reserve_live_call().is_err() {
+        return Err(XCapError::capture_failed(format!(
+            "{name}: skipped — {MAX_LIVE_SCK_CALLS} ScreenCaptureKit calls already in flight; daemon unresponsive"
+        )));
+    }
+
     let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
     let state = Arc::new(AtomicU8::new(WEDGE_PENDING));
     let worker_state = Arc::clone(&state);
@@ -103,8 +145,15 @@ where
                 // we completed after all, so clear it.
                 WEDGED_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
             }
+            // The OS call returned, so this thread is no longer a leak
+            // candidate. Released last, after the wedge handoff, so the two
+            // counters can never both be free while the thread is still
+            // inside ScreenCaptureKit. A worker that never returns keeps its
+            // reservation forever — that is the bound doing its job.
+            LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
         });
     if let Err(e) = spawn_result {
+        LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
         return Err(XCapError::capture_failed(format!(
             "{name}: failed to spawn worker thread: {e}"
         )));
@@ -791,6 +840,100 @@ mod tests {
             after_completion < after_timeout,
             "late-completing worker must clear its wedged slot ({after_timeout} -> {after_completion})"
         );
+    }
+
+    /// Regression for the admission race that turned the leak guard into a
+    /// no-op. The cap was a check-then-act: `load()` before spawn, but the
+    /// counter only moved on *timeout*. Callers arriving together therefore
+    /// all read 0, all spawned, and all leaked a thread. Production logs on
+    /// 2026-08-06 show `abandoning worker (5 wedged)`, `(6 wedged)` and
+    /// `(7 wedged)` against `MAX_WEDGED_SCK_CALLS = 4`.
+    ///
+    /// Deterministic: every admitted worker blocks on a condvar until the
+    /// assertions have run, so the whole burst is genuinely in flight at once
+    /// and no worker can complete early and free its slot.
+    #[test]
+    fn run_bounded_bounds_leaked_threads_under_concurrent_callers() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+
+        const CALLERS: usize = 12;
+        let baseline = WEDGED_SCK_CALLS.load(Ordering::Acquire);
+        // Tests that drive real ScreenCaptureKit do not take this lock, so
+        // they can hold live slots for the duration. Everything below is
+        // measured as a delta against that, never as an absolute.
+        let live_baseline = LIVE_SCK_CALLS.load(Ordering::Acquire);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    run_bounded(
+                        "test-concurrent-admission",
+                        std::time::Duration::from_millis(50),
+                        move || {
+                            let (lock, cv) = &*release;
+                            let mut done = lock.lock().unwrap();
+                            while !*done {
+                                done = cv.wait(done).unwrap();
+                            }
+                            0u32
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        // Every caller returns at its own 50ms deadline; none waits on the
+        // held workers.
+        let admitted = callers
+            .into_iter()
+            .map(|c| c.join().expect("caller thread panicked"))
+            .filter(|r| match r {
+                Ok(_) => true,
+                // Fail-fast rejections are the guard doing its job; only
+                // calls that actually spawned a worker count as admitted.
+                Err(e) => !format!("{e}").contains("skipped"),
+            })
+            .count();
+
+        let wedged = WEDGED_SCK_CALLS.load(Ordering::Acquire) - baseline;
+        assert!(
+            admitted <= MAX_LIVE_SCK_CALLS,
+            "admitted {admitted} concurrent SCK calls with a live cap of {MAX_LIVE_SCK_CALLS}"
+        );
+        assert!(
+            wedged <= MAX_LIVE_SCK_CALLS,
+            "leaked {wedged} worker threads with a live cap of {MAX_LIVE_SCK_CALLS} \
+             (check-then-act admission lets a burst through the guard)"
+        );
+
+        // Release the held workers; every reserved slot must drain back.
+        {
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while WEDGED_SCK_CALLS.load(Ordering::Acquire) != baseline {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released workers never drained their wedged slots: {} != baseline {baseline}",
+                WEDGED_SCK_CALLS.load(Ordering::Acquire)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while LIVE_SCK_CALLS.load(Ordering::Acquire) > live_baseline {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live-call reservations leaked after every worker completed: {} > baseline {live_baseline}",
+                LIVE_SCK_CALLS.load(Ordering::Acquire)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
