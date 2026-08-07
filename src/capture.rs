@@ -8,8 +8,9 @@ use cidre::{api, cv, ns, sc};
 use image::RgbaImage;
 use once_cell::sync::Lazy;
 use std::panic;
+use std::time::Duration;
 use tokio::runtime::Runtime;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{XCapError, XCapResult};
 
@@ -39,6 +40,106 @@ const MAX_WEDGED_SCK_CALLS: usize = 4;
 /// and have not completed yet. Decremented by the worker when the wedged OS
 /// call eventually returns (or never, if it doesn't).
 static WEDGED_SCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How long the fail-fast gate stays shut after the wedged cap is reached
+/// before a single probe is allowed through.
+///
+/// Without this the gate is permanent. `WEDGED_SCK_CALLS` only decrements if a
+/// wedged worker's OS call eventually returns, and a completion handler that
+/// never fires never returns — so four permanently wedged calls disable every
+/// ScreenCaptureKit path in the process for its entire lifetime. #18 bounded
+/// how fast that state is reached; it did not make it recoverable, and said so:
+/// "screen capture stops until the app is fully restarted; an in-process
+/// VisionManager restart cannot help because the leaked threads belong to the
+/// process."
+///
+/// Observed in production: a macOS host carried 3 permanently parked
+/// `sck-shareable-content` threads for more than four hours after a transient
+/// daemon outage, one wedge away from disabling capture until relaunch.
+const WEDGE_GATE_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Hard ceiling on threads leaked across the process lifetime. The probe below
+/// leaks at most one thread per `WEDGE_GATE_PROBE_INTERVAL` while the daemon
+/// stays dead, so this is what stops a multi-hour outage from leaking without
+/// bound. Reaching it means the process genuinely needs a restart.
+const MAX_LEAKED_SCK_THREADS: usize = 32;
+
+/// Unix seconds when the wedged cap was last observed, or 0 if never. Drives
+/// the half-open probe.
+static WEDGE_GATE_ARMED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set while a single probe call is in flight past a shut gate, so exactly one
+/// caller tests the daemon per interval instead of the whole burst.
+static WEDGE_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Threads leaked since process start and never recovered. Only ever
+/// decremented by a late completion, exactly like `WEDGED_SCK_CALLS`.
+static LEAKED_SCK_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Outcome of consulting the wedged-call gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WedgeGate {
+    /// Under the cap: ordinary admission.
+    Open,
+    /// Over the cap, but the probe interval has elapsed and this caller owns
+    /// the single probe. It must clear `WEDGE_PROBE_IN_FLIGHT` when done.
+    Probe,
+    /// Over the cap and the interval has not elapsed, or another probe owns
+    /// this window, or the process has leaked too many threads to continue.
+    Closed { permanent: bool },
+}
+
+/// Decide whether a call may proceed, clock injected for testing.
+///
+/// A success through the probe is direct evidence the daemon is responsive
+/// again, so `run_bounded` resets `WEDGED_SCK_CALLS` on any completion. The
+/// leaked-thread count is deliberately *not* reset: those threads are still
+/// parked, and `MAX_LEAKED_SCK_THREADS` is what bounds them.
+pub(crate) fn evaluate_wedge_gate(now_secs: u64) -> WedgeGate {
+    use std::sync::atomic::Ordering;
+
+    if LEAKED_SCK_THREADS.load(Ordering::Acquire) >= MAX_LEAKED_SCK_THREADS {
+        return WedgeGate::Closed { permanent: true };
+    }
+    if WEDGED_SCK_CALLS.load(Ordering::Acquire) < MAX_WEDGED_SCK_CALLS {
+        return WedgeGate::Open;
+    }
+
+    let armed_at = WEDGE_GATE_ARMED_AT.load(Ordering::Acquire);
+    if armed_at == 0 {
+        // First tick at the cap: start the interval, stay shut.
+        WEDGE_GATE_ARMED_AT.store(now_secs, Ordering::Release);
+        return WedgeGate::Closed { permanent: false };
+    }
+    if now_secs.saturating_sub(armed_at) < WEDGE_GATE_PROBE_INTERVAL.as_secs() {
+        return WedgeGate::Closed { permanent: false };
+    }
+
+    // Interval elapsed — let exactly one caller test the daemon.
+    if WEDGE_PROBE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return WedgeGate::Closed { permanent: false };
+    }
+    WEDGE_GATE_ARMED_AT.store(now_secs, Ordering::Release);
+    WedgeGate::Probe
+}
+
+/// Clear the wedged-call breaker after a completion proves the daemon lives.
+fn reset_wedge_breaker() {
+    use std::sync::atomic::Ordering;
+    WEDGED_SCK_CALLS.store(0, Ordering::Release);
+    WEDGE_GATE_ARMED_AT.store(0, Ordering::Release);
+}
 
 /// Upper bound on worker threads inside a ScreenCaptureKit call at once,
 /// whether or not they have passed their deadline yet.
@@ -110,11 +211,48 @@ where
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
 
-    if WEDGED_SCK_CALLS.load(Ordering::Acquire) >= MAX_WEDGED_SCK_CALLS {
-        return Err(XCapError::capture_failed(format!(
-            "{name}: skipped — {MAX_WEDGED_SCK_CALLS} ScreenCaptureKit calls already wedged; daemon unresponsive"
-        )));
+    // Half-open breaker rather than a permanent gate: see
+    // `WEDGE_GATE_PROBE_INTERVAL`.
+    let gate = evaluate_wedge_gate(now_unix_secs());
+    let is_probe = match gate {
+        WedgeGate::Open => false,
+        WedgeGate::Probe => {
+            warn!(
+                "{name}: probing ScreenCaptureKit after {MAX_WEDGED_SCK_CALLS} wedged calls; \
+                 one call allowed through to test whether the daemon recovered"
+            );
+            true
+        }
+        WedgeGate::Closed { permanent } => {
+            let reason = if permanent {
+                format!(
+                    "{MAX_LEAKED_SCK_THREADS} ScreenCaptureKit worker threads leaked; \
+                     the process must be restarted"
+                )
+            } else {
+                format!(
+                    "{MAX_WEDGED_SCK_CALLS} ScreenCaptureKit calls already wedged; \
+                     daemon unresponsive, retrying in up to {}s",
+                    WEDGE_GATE_PROBE_INTERVAL.as_secs()
+                )
+            };
+            return Err(XCapError::capture_failed(format!(
+                "{name}: skipped — {reason}"
+            )));
+        }
+    };
+
+    // Release the probe slot on every exit path below, including the error
+    // returns, so a failed probe can never wedge the breaker half-open.
+    struct ProbeGuard(bool);
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                WEDGE_PROBE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
+    let _probe_guard = ProbeGuard(is_probe);
 
     // Reserved before the spawn, released by the worker. Without this the
     // wedged check above is a check-then-act: it is only charged on timeout,
@@ -146,8 +284,10 @@ where
                 .is_err()
             {
                 // Receiver already abandoned us and counted a wedged slot —
-                // we completed after all, so clear it.
+                // we completed after all, so clear it. The thread is no
+                // longer parked, so release its leak charge as well.
                 WEDGED_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
+                LEAKED_SCK_THREADS.fetch_sub(1, Ordering::AcqRel);
             }
             // The OS call returned, so this thread is no longer a leak
             // candidate. Released last, after the wedge handoff, so the two
@@ -180,7 +320,13 @@ where
     };
 
     match rx.recv_timeout(timeout) {
-        Ok(result) => unpack(result),
+        Ok(result) => {
+            // The OS call returned, so the daemon is responsive. Clear the
+            // breaker: leaked threads stay counted in `LEAKED_SCK_THREADS`,
+            // but they must not keep failing calls that now succeed.
+            reset_wedge_breaker();
+            unpack(result)
+        }
         Err(_) => {
             match state.compare_exchange(
                 WEDGE_PENDING,
@@ -193,6 +339,7 @@ where
                     // OS call. Count the wedged slot; the worker's failed CAS
                     // clears it if the call ever completes.
                     WEDGED_SCK_CALLS.fetch_add(1, Ordering::AcqRel);
+                    LEAKED_SCK_THREADS.fetch_add(1, Ordering::AcqRel);
                     tracing::warn!(
                         "{name}: ScreenCaptureKit call did not complete within {:?} — abandoning worker ({} wedged)",
                         timeout,
@@ -959,14 +1106,124 @@ mod tests {
         use std::sync::atomic::Ordering;
         // Simulate MAX_WEDGED_SCK_CALLS abandoned workers.
         WEDGED_SCK_CALLS.store(MAX_WEDGED_SCK_CALLS, Ordering::Release);
+        WEDGE_GATE_ARMED_AT.store(0, Ordering::Release);
         let start = std::time::Instant::now();
         let result = run_bounded("test-capped", std::time::Duration::from_secs(5), || 1u32);
         WEDGED_SCK_CALLS.store(0, Ordering::Release);
+        WEDGE_GATE_ARMED_AT.store(0, Ordering::Release);
+        WEDGE_PROBE_IN_FLIGHT.store(false, Ordering::Release);
         assert!(result.is_err(), "must fail fast at the wedge cap");
         assert!(
             start.elapsed() < std::time::Duration::from_millis(500),
             "capped call must not spawn a worker or wait"
         );
+    }
+
+    /// Reset every piece of breaker state so gate tests do not leak into each
+    /// other through the process-global counters.
+    #[cfg(test)]
+    fn reset_gate_state_for_test() {
+        use std::sync::atomic::Ordering;
+        WEDGED_SCK_CALLS.store(0, Ordering::Release);
+        LEAKED_SCK_THREADS.store(0, Ordering::Release);
+        WEDGE_GATE_ARMED_AT.store(0, Ordering::Release);
+        WEDGE_PROBE_IN_FLIGHT.store(false, Ordering::Release);
+    }
+
+    /// The bug: before this change the gate was permanent. `WEDGED_SCK_CALLS`
+    /// only decrements if a wedged call eventually returns, and a completion
+    /// handler that never fires never returns, so four wedges disabled every
+    /// ScreenCaptureKit path for the life of the process.
+    #[test]
+    fn wedge_gate_reopens_for_a_probe_after_the_interval() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        WEDGED_SCK_CALLS.store(MAX_WEDGED_SCK_CALLS, Ordering::Release);
+        let t0 = 1_000_000u64;
+
+        // First tick at the cap arms the interval and stays shut.
+        assert_eq!(
+            evaluate_wedge_gate(t0),
+            WedgeGate::Closed { permanent: false }
+        );
+        // Still inside the interval.
+        assert_eq!(
+            evaluate_wedge_gate(t0 + WEDGE_GATE_PROBE_INTERVAL.as_secs() - 1),
+            WedgeGate::Closed { permanent: false }
+        );
+        // Interval elapsed: exactly one caller gets the probe.
+        assert_eq!(
+            evaluate_wedge_gate(t0 + WEDGE_GATE_PROBE_INTERVAL.as_secs()),
+            WedgeGate::Probe
+        );
+        // A concurrent caller in the same window does not also probe.
+        assert_eq!(
+            evaluate_wedge_gate(t0 + WEDGE_GATE_PROBE_INTERVAL.as_secs()),
+            WedgeGate::Closed { permanent: false }
+        );
+
+        reset_gate_state_for_test();
+    }
+
+    /// A completion proves the daemon is responsive, so the breaker must clear
+    /// rather than keep failing calls that now succeed.
+    #[test]
+    fn successful_call_clears_the_breaker() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        WEDGED_SCK_CALLS.store(MAX_WEDGED_SCK_CALLS, Ordering::Release);
+        WEDGE_GATE_ARMED_AT.store(1, Ordering::Release);
+
+        reset_wedge_breaker();
+
+        assert_eq!(WEDGED_SCK_CALLS.load(Ordering::Acquire), 0);
+        assert_eq!(WEDGE_GATE_ARMED_AT.load(Ordering::Acquire), 0);
+        assert_eq!(evaluate_wedge_gate(2), WedgeGate::Open);
+
+        reset_gate_state_for_test();
+    }
+
+    /// Leaked threads are the resource the cap actually protects, and they are
+    /// NOT cleared by a success: those threads are still parked. Only the hard
+    /// ceiling stops a multi-hour outage from leaking without bound.
+    #[test]
+    fn leaked_thread_ceiling_is_permanent_and_survives_a_success() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        LEAKED_SCK_THREADS.store(MAX_LEAKED_SCK_THREADS, Ordering::Release);
+        assert_eq!(
+            evaluate_wedge_gate(1),
+            WedgeGate::Closed { permanent: true },
+            "the leak ceiling must not be probe-recoverable"
+        );
+
+        reset_wedge_breaker();
+        assert_eq!(
+            evaluate_wedge_gate(2),
+            WedgeGate::Closed { permanent: true },
+            "clearing the breaker must not forget parked threads"
+        );
+
+        reset_gate_state_for_test();
+    }
+
+    /// Under the cap nothing changes.
+    #[test]
+    fn wedge_gate_is_open_below_the_cap() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        WEDGED_SCK_CALLS.store(MAX_WEDGED_SCK_CALLS - 1, Ordering::Release);
+        assert_eq!(evaluate_wedge_gate(1), WedgeGate::Open);
+
+        reset_gate_state_for_test();
     }
 
     #[test]
