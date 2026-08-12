@@ -312,6 +312,7 @@ mod tests {
 
     #[test]
     fn test_window_all() {
+        let _sck_guard = crate::capture::lock_sck_globals();
         // This test verifies the API works
         // It will fail or succeed based on permission state
         let result = Window::all();
