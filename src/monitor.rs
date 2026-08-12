@@ -293,6 +293,7 @@ mod tests {
 
     #[test]
     fn test_monitor_all() {
+        let _sck_guard = crate::capture::lock_sck_globals();
         let result = Monitor::all();
         let _ = result;
     }

@@ -14,6 +14,26 @@ use tracing::{debug, warn};
 
 use crate::error::{XCapError, XCapResult};
 
+/// Serializes every test that touches the process-global ScreenCaptureKit
+/// counters (`LIVE_SCK_CALLS`, `WEDGED_SCK_CALLS`, `LEAKED_SCK_THREADS`).
+///
+/// These are process-wide, so a test asserting exact counter values races any
+/// concurrent test that makes a real SCK call — including tests in other
+/// modules, which is why this lives at crate level rather than inside
+/// `capture::tests`. Anything that calls `run_bounded`, directly or through
+/// `Monitor::all` / `Window::all` / `get_shareable_content`, must hold it.
+#[cfg(test)]
+pub(crate) static SCK_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`SCK_GLOBAL_TEST_LOCK`], ignoring poisoning from an unrelated failed
+/// test so one failure does not cascade into every other test in the suite.
+#[cfg(test)]
+pub(crate) fn lock_sck_globals() -> std::sync::MutexGuard<'static, ()> {
+    SCK_GLOBAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Global tokio runtime for blocking on async operations (only used when not in an existing runtime)
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -132,6 +152,19 @@ pub(crate) fn evaluate_wedge_gate(now_secs: u64) -> WedgeGate {
     }
     WEDGE_GATE_ARMED_AT.store(now_secs, Ordering::Release);
     WedgeGate::Probe
+}
+
+/// Decrement without wrapping past zero.
+///
+/// These counters are zeroed by `reset_wedge_breaker` while wedged workers are
+/// still parked, so a late completion can legitimately find nothing left to
+/// give back. `fetch_sub` would wrap a `usize` to `usize::MAX` and make the
+/// gate read as permanently over its cap.
+fn decrement_saturating(counter: &std::sync::atomic::AtomicUsize) {
+    use std::sync::atomic::Ordering;
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+        Some(v.saturating_sub(1))
+    });
 }
 
 /// Clear the wedged-call breaker after a completion proves the daemon lives.
@@ -302,20 +335,30 @@ where
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_err()
+                .is_ok()
             {
+                // Normal completion: the receiver never abandoned us, so we
+                // still own the live slot and release it here.
+                LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
+            } else {
                 // Receiver already abandoned us and counted a wedged slot —
                 // we completed after all, so clear it. The thread is no
-                // longer parked, so release its leak charge as well.
-                WEDGED_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
-                LEAKED_SCK_THREADS.fetch_sub(1, Ordering::AcqRel);
+                // longer parked, so release its leak charge as well. It
+                // already released the live slot when it charged the leak,
+                // so releasing again here would underflow the counter.
+                //
+                // Saturating, because `reset_wedge_breaker` can zero
+                // `WEDGED_SCK_CALLS` while this thread is still parked: any
+                // successful call clears the breaker, and a wedged worker
+                // whose handler fires afterwards would then decrement past
+                // zero. On a `usize` that wraps to `usize::MAX`, which reads
+                // as "far above the wedge cap" and shuts the gate for the
+                // life of the process — the exact permanent outage the
+                // breaker exists to prevent, reached through its own
+                // recovery path.
+                decrement_saturating(&WEDGED_SCK_CALLS);
+                decrement_saturating(&LEAKED_SCK_THREADS);
             }
-            // The OS call returned, so this thread is no longer a leak
-            // candidate. Released last, after the wedge handoff, so the two
-            // counters can never both be free while the thread is still
-            // inside ScreenCaptureKit. A worker that never returns keeps its
-            // reservation forever — that is the bound doing its job.
-            LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
         });
     if let Err(e) = spawn_result {
         LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
@@ -361,6 +404,18 @@ where
                     // clears it if the call ever completes.
                     WEDGED_SCK_CALLS.fetch_add(1, Ordering::AcqRel);
                     LEAKED_SCK_THREADS.fetch_add(1, Ordering::AcqRel);
+                    // Hand the thread from the concurrency bound to the leak
+                    // bound. `LIVE_SCK_CALLS` limits calls that are expected
+                    // to return; this one is not, and it is now counted by
+                    // `LEAKED_SCK_THREADS` instead. Charging a parked thread
+                    // to both is what made the outage permanent: the live
+                    // count could never fall back under the cap on its own,
+                    // so even after a probe proved the daemon healthy and
+                    // cleared the breaker, every ordinary call was still
+                    // refused. Releasing here cannot uncap a dead daemon —
+                    // once `MAX_WEDGED_SCK_CALLS` are charged the gate, not
+                    // this counter, is what refuses callers.
+                    LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
                     tracing::warn!(
                         "{name}: ScreenCaptureKit call did not complete within {:?} — abandoning worker ({} wedged)",
                         timeout,
@@ -894,13 +949,14 @@ async fn capture_monitor_oneshot(
 mod tests {
     use super::*;
 
-    /// `run_bounded` tests share the process-global `WEDGED_SCK_CALLS`
-    /// counter, so they must not run concurrently with each other.
-    static RUN_BOUNDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `run_bounded` tests share the process-global SCK counters, so they must
+    /// not run concurrently with each other *or* with any other test that
+    /// makes a real ScreenCaptureKit call. See [`SCK_GLOBAL_TEST_LOCK`].
+    use super::lock_sck_globals;
 
     #[test]
     fn run_bounded_returns_value_on_completion() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         let result = run_bounded("test-ok", std::time::Duration::from_secs(5), || 42u32);
         assert_eq!(result.unwrap(), 42);
     }
@@ -914,7 +970,7 @@ mod tests {
     #[test]
     fn run_bounded_late_completion_clears_its_wedged_slot() {
         use std::sync::atomic::Ordering;
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
 
         let baseline = WEDGED_SCK_CALLS.load(Ordering::Acquire);
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -953,7 +1009,7 @@ mod tests {
     #[test]
     fn run_bounded_near_deadline_completions_never_leak_wedged_slots() {
         use std::sync::atomic::Ordering;
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
 
         let baseline = WEDGED_SCK_CALLS.load(Ordering::Acquire);
         for i in 0..40 {
@@ -986,7 +1042,7 @@ mod tests {
 
     #[test]
     fn run_bounded_times_out_on_stuck_closure() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         let start = std::time::Instant::now();
         let result = run_bounded("test-stuck", std::time::Duration::from_millis(100), || {
             // Simulate an SCK completion handler that never fires. Bounded
@@ -1028,7 +1084,7 @@ mod tests {
     fn run_bounded_bounds_leaked_threads_under_concurrent_callers() {
         use std::sync::atomic::Ordering;
         use std::sync::Arc;
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
 
         const CALLERS: usize = 12;
         let baseline = WEDGED_SCK_CALLS.load(Ordering::Acquire);
@@ -1110,7 +1166,7 @@ mod tests {
 
     #[test]
     fn run_bounded_surfaces_panics_as_errors() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         let result = run_bounded("test-panic", std::time::Duration::from_secs(5), || {
             panic!("boom");
         });
@@ -1123,7 +1179,7 @@ mod tests {
 
     #[test]
     fn run_bounded_fails_fast_once_wedge_cap_reached() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         // Simulate MAX_WEDGED_SCK_CALLS abandoned workers.
         WEDGED_SCK_CALLS.store(MAX_WEDGED_SCK_CALLS, Ordering::Release);
@@ -1138,6 +1194,209 @@ mod tests {
             start.elapsed() < std::time::Duration::from_millis(500),
             "capped call must not spawn a worker or wait"
         );
+    }
+
+    /// End-to-end: a real burst wedges every live slot, the daemon comes
+    /// back, and ordinary capture must actually resume.
+    ///
+    /// Charging a permanently parked worker to both `LIVE_SCK_CALLS` and
+    /// `LEAKED_SCK_THREADS` meant the live count could never fall back under
+    /// the cap on its own, so a probe cleared the breaker and every ordinary
+    /// call was *still* refused — a recovered daemon with dead capture until
+    /// relaunch.
+    #[test]
+    fn capture_resumes_for_ordinary_callers_after_a_burst_wedges_every_slot() {
+        let _guard = lock_sck_globals();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        // A simultaneous burst: all callers observe zero wedged calls, all are
+        // admitted, and all wedge. This is the scenario MAX_LIVE_SCK_CALLS was
+        // added for, and the only way to genuinely saturate the live counter.
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let burst: Vec<_> = (0..MAX_LIVE_SCK_CALLS)
+            .map(|i| {
+                let r = std::sync::Arc::clone(&release);
+                std::thread::spawn(move || {
+                    run_bounded(
+                        "test-burst",
+                        std::time::Duration::from_millis(50),
+                        move || {
+                            while !r.load(Ordering::Acquire) {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            i as u32
+                        },
+                    )
+                })
+            })
+            .collect();
+        for h in burst {
+            assert!(h.join().unwrap().is_err(), "every burst call must time out");
+        }
+
+        assert_eq!(
+            LIVE_SCK_CALLS.load(Ordering::Acquire),
+            0,
+            "abandoned workers must hand their slots to the leak bound"
+        );
+        assert_eq!(
+            LEAKED_SCK_THREADS.load(Ordering::Acquire),
+            MAX_LIVE_SCK_CALLS
+        );
+        assert!(WEDGED_SCK_CALLS.load(Ordering::Acquire) >= MAX_WEDGED_SCK_CALLS);
+
+        // Daemon comes back: the gate is shut, so recovery goes through a probe.
+        WEDGE_GATE_ARMED_AT.store(
+            now_unix_secs().saturating_sub(WEDGE_GATE_PROBE_INTERVAL.as_secs() + 1),
+            Ordering::Release,
+        );
+        assert!(
+            run_bounded("test-probe", std::time::Duration::from_secs(5), || 1u32).is_ok(),
+            "the probe must be admitted so the breaker can reheal"
+        );
+        assert_eq!(
+            WEDGED_SCK_CALLS.load(Ordering::Acquire),
+            0,
+            "a completed probe proves the daemon is alive and must clear the breaker"
+        );
+
+        let ordinary = run_bounded("test-ordinary", std::time::Duration::from_secs(5), || 2u32);
+
+        // Drain the parked burst threads before touching the counters again:
+        // each one still owes a wedge/leak decrement, and letting those land
+        // after the reset would corrupt the next test.
+        release.store(true, Ordering::Release);
+        for _ in 0..400 {
+            if LEAKED_SCK_THREADS.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            LEAKED_SCK_THREADS.load(Ordering::Acquire),
+            0,
+            "every burst worker must give its leak charge back once it returns"
+        );
+        reset_gate_state_for_test();
+
+        assert_eq!(
+            ordinary.ok(),
+            Some(2),
+            "ordinary capture must resume once the daemon is proven healthy, or \
+             the probe only unblocks itself and the outage lasts until relaunch"
+        );
+    }
+
+    /// A wedged worker whose handler fires after the breaker was cleared must
+    /// not wrap the counter past zero.
+    ///
+    /// `reset_wedge_breaker` zeroes `WEDGED_SCK_CALLS` on *any* successful
+    /// call, so this is reachable with a single wedge: wedge one call, let any
+    /// later call succeed, then have the wedged handler fire. An unsaturated
+    /// `fetch_sub` wraps a `usize` to `usize::MAX`, which the gate reads as
+    /// "far past the wedge cap" and shuts capture down for the life of the
+    /// process — with no probe able to reopen it, because the leaked-thread
+    /// ceiling wraps the same way.
+    #[test]
+    fn a_late_completion_after_a_breaker_reset_cannot_wrap_the_counters() {
+        let _guard = lock_sck_globals();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_release = std::sync::Arc::clone(&release);
+        let timed_out = run_bounded(
+            "test-late",
+            std::time::Duration::from_millis(50),
+            move || {
+                while !worker_release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                1u32
+            },
+        );
+        assert!(timed_out.is_err());
+        assert_eq!(WEDGED_SCK_CALLS.load(Ordering::Acquire), 1);
+
+        // Any successful call clears the breaker while that worker is parked.
+        assert!(run_bounded("test-ok", std::time::Duration::from_secs(5), || 2u32).is_ok());
+        assert_eq!(WEDGED_SCK_CALLS.load(Ordering::Acquire), 0);
+
+        // Now the parked handler finally fires.
+        release.store(true, Ordering::Release);
+        for _ in 0..400 {
+            if LEAKED_SCK_THREADS.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let wedged = WEDGED_SCK_CALLS.load(Ordering::Acquire);
+        let leaked = LEAKED_SCK_THREADS.load(Ordering::Acquire);
+        let gate = evaluate_wedge_gate(now_unix_secs());
+        reset_gate_state_for_test();
+
+        assert_eq!(wedged, 0, "wedged counter wrapped past zero: {wedged}");
+        assert_eq!(leaked, 0, "leaked counter wrapped past zero: {leaked}");
+        assert_eq!(
+            gate,
+            WedgeGate::Open,
+            "a wrapped counter reads as over the cap and shuts capture permanently"
+        );
+    }
+
+    /// A worker abandoned past its deadline must hand itself from the
+    /// concurrency bound to the leak bound exactly once, never both and never
+    /// twice — a double release would underflow the live counter and uncap
+    /// concurrency entirely.
+    #[test]
+    fn an_abandoned_worker_moves_from_the_live_bound_to_the_leak_bound() {
+        let _guard = lock_sck_globals();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_release = std::sync::Arc::clone(&release);
+
+        // Times out while the closure is still inside its "OS call".
+        let timed_out = run_bounded(
+            "test-abandon",
+            std::time::Duration::from_millis(50),
+            move || {
+                while !worker_release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                9u32
+            },
+        );
+        assert!(timed_out.is_err(), "the call must report a timeout");
+        assert_eq!(
+            LIVE_SCK_CALLS.load(Ordering::Acquire),
+            0,
+            "an abandoned worker must free its live slot for the leak bound"
+        );
+        assert_eq!(LEAKED_SCK_THREADS.load(Ordering::Acquire), 1);
+        assert_eq!(WEDGED_SCK_CALLS.load(Ordering::Acquire), 1);
+
+        // Let the "OS call" finally return: the late worker clears its wedge
+        // and leak charges but must not release the live slot a second time.
+        release.store(true, Ordering::Release);
+        for _ in 0..200 {
+            if LEAKED_SCK_THREADS.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(LEAKED_SCK_THREADS.load(Ordering::Acquire), 0);
+        assert_eq!(WEDGED_SCK_CALLS.load(Ordering::Acquire), 0);
+        assert_eq!(
+            LIVE_SCK_CALLS.load(Ordering::Acquire),
+            0,
+            "a late completion must not double-release the live slot"
+        );
+
+        reset_gate_state_for_test();
     }
 
     /// Reset every piece of breaker state so gate tests do not leak into each
@@ -1162,7 +1421,7 @@ mod tests {
     /// the life of the process — the permanent outage #19 set out to remove.
     #[test]
     fn probe_runs_even_when_wedged_workers_hold_every_live_slot() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         reset_gate_state_for_test();
 
@@ -1205,7 +1464,7 @@ mod tests {
     /// callers are still refused once the live cap is reached.
     #[test]
     fn ordinary_callers_are_still_capped_while_slots_are_held() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         reset_gate_state_for_test();
 
@@ -1237,7 +1496,7 @@ mod tests {
     /// ScreenCaptureKit path for the life of the process.
     #[test]
     fn wedge_gate_reopens_for_a_probe_after_the_interval() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         reset_gate_state_for_test();
 
@@ -1272,7 +1531,7 @@ mod tests {
     /// rather than keep failing calls that now succeed.
     #[test]
     fn successful_call_clears_the_breaker() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         reset_gate_state_for_test();
 
@@ -1293,7 +1552,7 @@ mod tests {
     /// ceiling stops a multi-hour outage from leaking without bound.
     #[test]
     fn leaked_thread_ceiling_is_permanent_and_survives_a_success() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         reset_gate_state_for_test();
 
@@ -1317,7 +1576,7 @@ mod tests {
     /// Under the cap nothing changes.
     #[test]
     fn wedge_gate_is_open_below_the_cap() {
-        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         reset_gate_state_for_test();
 
@@ -1329,6 +1588,7 @@ mod tests {
 
     #[test]
     fn test_get_shareable_content() {
+        let _sck_guard = crate::capture::lock_sck_globals();
         // This test will fail if screen recording permission is not granted
         let content = get_shareable_content();
         // We just verify the API works
@@ -1337,6 +1597,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_shareable_content() {
+        let _sck_guard = crate::capture::lock_sck_globals();
         let content = sc::ShareableContent::current().await;
         if let Ok(content) = content {
             assert!(!content.windows().is_empty() || !content.displays().is_empty());
