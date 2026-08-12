@@ -164,8 +164,28 @@ static LIVE_SCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 /// Atomically claim a live-call slot, or report the cap. A CAS loop rather
 /// than `load` + `fetch_add`: the load-then-act version is exactly the race
 /// this guard exists to close.
-fn try_reserve_live_call() -> Result<(), usize> {
+///
+/// A probe is admitted unconditionally. `MAX_LIVE_SCK_CALLS` exists to stop a
+/// *burst of ordinary callers* from all spawning at once; applying it to the
+/// probe instead starves the recovery path, because a wedged worker holds its
+/// slot forever. Once `MAX_LIVE_SCK_CALLS` calls are wedged the counter can
+/// never fall below the cap on its own, so the probe #19 added to reopen the
+/// gate could never obtain a slot and the gate stayed permanently shut — the
+/// exact failure #19 set out to remove. Observed in production: six parked
+/// `sck-shareable-content` threads with the gate arming a probe every 60s that
+/// was rejected by the live cap every time, for hours, until the process was
+/// relaunched.
+///
+/// Probes cannot run away: `WEDGE_PROBE_IN_FLIGHT` admits one at a time,
+/// `WEDGE_GATE_PROBE_INTERVAL` spaces them a minute apart, and
+/// `MAX_LEAKED_SCK_THREADS` is checked before the gate returns `Probe` at all
+/// — that ceiling, not this cap, is what bounds a multi-hour outage.
+fn try_reserve_live_call(is_probe: bool) -> Result<(), usize> {
     use std::sync::atomic::Ordering;
+    if is_probe {
+        LIVE_SCK_CALLS.fetch_add(1, Ordering::AcqRel);
+        return Ok(());
+    }
     LIVE_SCK_CALLS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
             (live < MAX_LIVE_SCK_CALLS).then_some(live + 1)
@@ -257,8 +277,9 @@ where
     // Reserved before the spawn, released by the worker. Without this the
     // wedged check above is a check-then-act: it is only charged on timeout,
     // so a simultaneous burst all reads the pre-burst count and every caller
-    // spawns a thread that goes on to wedge.
-    if try_reserve_live_call().is_err() {
+    // spawns a thread that goes on to wedge. A probe bypasses the cap so the
+    // recovery path is not starved by the wedged workers it exists to escape.
+    if try_reserve_live_call(is_probe).is_err() {
         return Err(XCapError::capture_failed(format!(
             "{name}: skipped — {MAX_LIVE_SCK_CALLS} ScreenCaptureKit calls already in flight; daemon unresponsive"
         )));
@@ -1128,6 +1149,86 @@ mod tests {
         LEAKED_SCK_THREADS.store(0, Ordering::Release);
         WEDGE_GATE_ARMED_AT.store(0, Ordering::Release);
         WEDGE_PROBE_IN_FLIGHT.store(false, Ordering::Release);
+        // Live slots are held by wedged workers in production and were never
+        // reset here, which is why the starvation below went unnoticed: the
+        // probe test ran with an empty live counter.
+        LIVE_SCK_CALLS.store(0, Ordering::Release);
+    }
+
+    /// The bug this change fixes: #18's live-call cap and #19's recovery probe
+    /// deadlocked each other. A wedged worker holds its live slot forever, so
+    /// once `MAX_LIVE_SCK_CALLS` calls are wedged the probe that is supposed to
+    /// reopen the gate can never reserve a slot, and the gate stays shut for
+    /// the life of the process — the permanent outage #19 set out to remove.
+    #[test]
+    fn probe_runs_even_when_wedged_workers_hold_every_live_slot() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        // Every live slot held by a permanently wedged worker, gate armed long
+        // enough ago that this caller owns the probe.
+        LIVE_SCK_CALLS.store(MAX_LIVE_SCK_CALLS, Ordering::Release);
+        WEDGED_SCK_CALLS.store(MAX_WEDGED_SCK_CALLS, Ordering::Release);
+        WEDGE_GATE_ARMED_AT.store(
+            now_unix_secs().saturating_sub(WEDGE_GATE_PROBE_INTERVAL.as_secs() + 1),
+            Ordering::Release,
+        );
+
+        let result = run_bounded("test-probe", std::time::Duration::from_secs(5), || 7u32);
+
+        assert_eq!(
+            result.ok(),
+            Some(7),
+            "the probe must be admitted past a saturated live cap, or the \
+             breaker can never reheal and capture is dead until relaunch"
+        );
+        // The probe completed, which proves the daemon is alive, so the
+        // breaker must be clear rather than still counting the old wedges.
+        assert_eq!(WEDGED_SCK_CALLS.load(Ordering::Acquire), 0);
+        // And it must release its own slot, leaving only the pre-existing
+        // wedged workers charged.
+        assert_eq!(
+            LIVE_SCK_CALLS.load(Ordering::Acquire),
+            MAX_LIVE_SCK_CALLS,
+            "a completed probe must not leak a live slot"
+        );
+        assert!(
+            !WEDGE_PROBE_IN_FLIGHT.load(Ordering::Acquire),
+            "probe slot must be released on the success path"
+        );
+
+        reset_gate_state_for_test();
+    }
+
+    /// The probe bypass must not become a hole in the burst guard: ordinary
+    /// callers are still refused once the live cap is reached.
+    #[test]
+    fn ordinary_callers_are_still_capped_while_slots_are_held() {
+        let _guard = RUN_BOUNDED_TEST_LOCK.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        reset_gate_state_for_test();
+
+        LIVE_SCK_CALLS.store(MAX_LIVE_SCK_CALLS, Ordering::Release);
+
+        let start = std::time::Instant::now();
+        let result = run_bounded("test-burst", std::time::Duration::from_secs(5), || 1u32);
+
+        assert!(
+            result.is_err(),
+            "a non-probe caller must not bypass the live cap"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "capped call must not spawn a worker or wait"
+        );
+        assert_eq!(
+            LIVE_SCK_CALLS.load(Ordering::Acquire),
+            MAX_LIVE_SCK_CALLS,
+            "a refused call must not charge a slot"
+        );
+
+        reset_gate_state_for_test();
     }
 
     /// The bug: before this change the gate was permanent. `WEDGED_SCK_CALLS`
