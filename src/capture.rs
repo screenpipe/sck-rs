@@ -536,6 +536,67 @@ extern "C" {
     fn CVPixelBufferGetBaseAddress(pixelBuffer: *const std::ffi::c_void) -> *const u8;
 }
 
+/// Convert a locked BGRA framebuffer into an [`RgbaImage`].
+///
+/// This is the hottest function in the capture path: it runs on the
+/// ScreenCaptureKit delegate queue for every delivered frame, so a full display
+/// is copied here at the stream's frame rate.
+///
+/// The previous implementation pushed four bytes per pixel into a `Vec` behind
+/// a per-pixel `if pixel_start + 3 < pixels.len()` guard. That guard made the
+/// output length data-dependent, so LLVM could not vectorize the loop or hoist
+/// the bounds checks — a 1512x982 frame cost roughly 5.9M `push` calls plus
+/// 7.4M bounds checks. Slicing row-by-row and going through `chunks_exact(4)`
+/// lets the optimizer prove the lengths match and emit a vectorized copy, for
+/// the same bytes out. See `examples/bgra_bench.rs` to measure it here.
+///
+/// The dropped per-pixel guard was dead code. Callers validate
+/// `bytes_per_row >= width * 4` and construct the slice as exactly
+/// `bytes_per_row * height` bytes, so the largest index the old loop could
+/// produce was `data_size - 1`. The equivalent check is done once here, up
+/// front, and returns `None` so the caller reports the same error it always
+/// did rather than reading out of bounds.
+fn bgra_to_rgba(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_row: usize,
+) -> Option<RgbaImage> {
+    let row_len = width.checked_mul(4)?;
+    if bytes_per_row < row_len {
+        return None;
+    }
+    // Every row slice below must be in range; verify once instead of four
+    // times per pixel.
+    if bytes_per_row.checked_mul(height)? > pixels.len() {
+        return None;
+    }
+
+    let mut buffer = vec![0u8; row_len.checked_mul(height)?];
+
+    // `chunks_exact_mut` panics on a zero chunk size, and this runs inside a
+    // `catch_unwind` whose job is to keep a bad frame from taking the process
+    // down — so a zero-width buffer returns the empty image the old loop
+    // produced instead of unwinding. Zero dimensions are rejected upstream.
+    if row_len == 0 {
+        return RgbaImage::from_raw(width as u32, height as u32, buffer);
+    }
+
+    for (row, dst_row) in buffer.chunks_exact_mut(row_len).enumerate() {
+        let src_start = row * bytes_per_row;
+        let src_row = &pixels[src_start..src_start + row_len];
+        for (src, dst) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+            // BGRA -> RGBA
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = src[3];
+        }
+    }
+
+    RgbaImage::from_raw(width as u32, height as u32, buffer)
+}
+
 /// Extract an RGBA image from a cv::ImageBuf (pixel buffer)
 fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     // Get all metadata BEFORE locking
@@ -626,24 +687,7 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
         // Create a slice from the raw pixel data
         let pixels = unsafe { std::slice::from_raw_parts(pixels_ptr, data_size) };
 
-        // Copy and convert BGRA to RGBA
-        let mut buffer = Vec::with_capacity(width * height * 4);
-
-        for row in 0..height {
-            let row_start = row * bytes_per_row;
-            for col in 0..width {
-                let pixel_start = row_start + col * 4;
-                if pixel_start + 3 < pixels.len() {
-                    // BGRA to RGBA conversion
-                    buffer.push(pixels[pixel_start + 2]); // R
-                    buffer.push(pixels[pixel_start + 1]); // G
-                    buffer.push(pixels[pixel_start]); // B
-                    buffer.push(pixels[pixel_start + 3]); // A
-                }
-            }
-        }
-
-        RgbaImage::from_raw(width as u32, height as u32, buffer)
+        bgra_to_rgba(pixels, width, height, bytes_per_row)
             .ok_or_else(|| XCapError::capture_failed("Failed to create image from buffer"))
     };
 
@@ -1602,5 +1646,127 @@ mod tests {
         if let Ok(content) = content {
             assert!(!content.windows().is_empty() || !content.displays().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod bgra_tests {
+    use super::bgra_to_rgba;
+
+    /// The pre-optimization loop, kept verbatim as the correctness oracle.
+    fn reference(pixels: &[u8], width: usize, height: usize, bytes_per_row: usize) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(width * height * 4);
+        for row in 0..height {
+            let row_start = row * bytes_per_row;
+            for col in 0..width {
+                let pixel_start = row_start + col * 4;
+                if pixel_start + 3 < pixels.len() {
+                    buffer.push(pixels[pixel_start + 2]);
+                    buffer.push(pixels[pixel_start + 1]);
+                    buffer.push(pixels[pixel_start]);
+                    buffer.push(pixels[pixel_start + 3]);
+                }
+            }
+        }
+        buffer
+    }
+
+    /// Deterministic pseudo-random framebuffer.
+    fn framebuffer(len: usize) -> Vec<u8> {
+        let mut state = 0x12345678u32;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matches_reference_byte_for_byte() {
+        // Includes non-square, odd widths, and padded rows (bytes_per_row > w*4),
+        // which is what CoreVideo actually hands back for many displays.
+        for &(w, h, pad) in &[
+            (1usize, 1usize, 0usize),
+            (2, 3, 0),
+            (7, 5, 0),
+            (7, 5, 12),
+            (64, 64, 0),
+            (63, 17, 4),
+            (256, 128, 64),
+        ] {
+            let bpr = w * 4 + pad;
+            let pixels = framebuffer(bpr * h);
+            let got = bgra_to_rgba(&pixels, w, h, bpr).expect("conversion succeeds");
+            let want = reference(&pixels, w, h, bpr);
+            assert_eq!(
+                got.as_raw(),
+                &want,
+                "mismatch for {}x{} bpr={} (pad={})",
+                w,
+                h,
+                bpr,
+                pad
+            );
+            assert_eq!(got.width() as usize, w);
+            assert_eq!(got.height() as usize, h);
+        }
+    }
+
+    #[test]
+    fn swaps_red_and_blue_and_preserves_alpha() {
+        // One pixel: B=0x10 G=0x20 R=0x30 A=0x40 -> R=0x30 G=0x20 B=0x10 A=0x40
+        let pixels = [0x10u8, 0x20, 0x30, 0x40];
+        let img = bgra_to_rgba(&pixels, 1, 1, 4).unwrap();
+        assert_eq!(img.as_raw(), &[0x30, 0x20, 0x10, 0x40]);
+    }
+
+    #[test]
+    fn ignores_row_padding_bytes() {
+        // 1x2 image with 4 padding bytes per row. Padding must never appear.
+        let pixels = [
+            0x01, 0x02, 0x03, 0x04, 0xAA, 0xAA, 0xAA, 0xAA, // row 0 + pad
+            0x05, 0x06, 0x07, 0x08, 0xBB, 0xBB, 0xBB, 0xBB, // row 1 + pad
+        ];
+        let img = bgra_to_rgba(&pixels, 1, 2, 8).unwrap();
+        assert_eq!(
+            img.as_raw(),
+            &[0x03, 0x02, 0x01, 0x04, 0x07, 0x06, 0x05, 0x08]
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_buffer_instead_of_reading_out_of_bounds() {
+        // Claims 10 rows but only supplies 2 rows of bytes.
+        let pixels = framebuffer(4 * 4 * 2);
+        assert!(bgra_to_rgba(&pixels, 4, 10, 16).is_none());
+    }
+
+    #[test]
+    fn rejects_bytes_per_row_smaller_than_row() {
+        let pixels = framebuffer(64);
+        assert!(bgra_to_rgba(&pixels, 8, 2, 16).is_none());
+    }
+
+    #[test]
+    fn zero_width_does_not_panic() {
+        // `chunks_exact_mut(0)` would panic; the old loop just produced an
+        // empty buffer. Zero dimensions are rejected upstream, but this runs
+        // under catch_unwind precisely because frames can be malformed.
+        let pixels: Vec<u8> = vec![0; 64];
+        let img = bgra_to_rgba(&pixels, 0, 4, 16).expect("empty image, as before");
+        assert!(img.as_raw().is_empty());
+        assert_eq!(reference(&pixels, 0, 4, 16), *img.as_raw());
+    }
+
+    #[test]
+    fn zero_height_matches_reference_empty_image() {
+        // `image_buf_to_rgba` rejects zero dimensions before calling this, but
+        // the old loop produced an empty buffer here rather than panicking and
+        // `from_raw` accepted it. Preserve that exactly.
+        let pixels: Vec<u8> = Vec::new();
+        let img = bgra_to_rgba(&pixels, 4, 0, 16).expect("empty image, as before");
+        assert!(img.as_raw().is_empty());
+        assert_eq!(reference(&pixels, 4, 0, 16), *img.as_raw());
     }
 }
