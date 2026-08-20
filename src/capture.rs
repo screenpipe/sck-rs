@@ -78,10 +78,10 @@ static WEDGED_SCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// daemon outage, one wedge away from disabling capture until relaunch.
 const WEDGE_GATE_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Hard ceiling on threads leaked across the process lifetime. The probe below
+/// Hard ceiling on worker threads that are still parked past their deadline. The probe below
 /// leaks at most one thread per `WEDGE_GATE_PROBE_INTERVAL` while the daemon
 /// stays dead, so this is what stops a multi-hour outage from leaking without
-/// bound. Reaching it means the process genuinely needs a restart.
+/// bound. Calls remain disabled at the ceiling unless parked workers return.
 const MAX_LEAKED_SCK_THREADS: usize = 32;
 
 /// Unix seconds when the wedged cap was last observed, or 0 if never. Drives
@@ -93,9 +93,51 @@ static WEDGE_GATE_ARMED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static WEDGE_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Threads leaked since process start and never recovered. Only ever
-/// decremented by a late completion, exactly like `WEDGED_SCK_CALLS`.
+/// Workers currently parked past their deadline. Decremented by a late
+/// completion, exactly like `WEDGED_SCK_CALLS`.
 static LEAKED_SCK_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Process-wide state of the sync worker containment layer.
+///
+/// Known ScreenCaptureKit completion futures are cancelled at their own
+/// deadlines before the worker deadline expires. This status therefore
+/// describes the last-resort worker guard, not ordinary callback timeouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessStatus {
+    /// No worker has outlived its deadline.
+    Ready,
+    /// At least one worker outlived its deadline, but calls can still be
+    /// admitted (possibly through the half-open recovery probe).
+    Degraded {
+        wedged_calls: usize,
+        leaked_worker_threads: usize,
+    },
+    /// The hard parked-worker ceiling has been reached. Further calls are
+    /// refused so the process cannot leak threads without bound.
+    Exhausted { leaked_worker_threads: usize },
+}
+
+/// Return the current process-wide worker containment state.
+pub fn process_status() -> ProcessStatus {
+    use std::sync::atomic::Ordering;
+
+    let leaked_worker_threads = LEAKED_SCK_THREADS.load(Ordering::Acquire);
+    if leaked_worker_threads >= MAX_LEAKED_SCK_THREADS {
+        return ProcessStatus::Exhausted {
+            leaked_worker_threads,
+        };
+    }
+    let wedged_calls = WEDGED_SCK_CALLS.load(Ordering::Acquire);
+    if wedged_calls > 0 || leaked_worker_threads > 0 {
+        ProcessStatus::Degraded {
+            wedged_calls,
+            leaked_worker_threads,
+        }
+    } else {
+        ProcessStatus::Ready
+    }
+}
 
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -113,8 +155,9 @@ pub(crate) enum WedgeGate {
     /// the single probe. It must clear `WEDGE_PROBE_IN_FLIGHT` when done.
     Probe,
     /// Over the cap and the interval has not elapsed, or another probe owns
-    /// this window, or the process has leaked too many threads to continue.
-    Closed { permanent: bool },
+    /// this window. `exhausted` means too many workers remain parked to admit
+    /// even a probe; a late completion can still bring the count below it.
+    Closed { exhausted: bool },
 }
 
 /// Decide whether a call may proceed, clock injected for testing.
@@ -127,7 +170,7 @@ pub(crate) fn evaluate_wedge_gate(now_secs: u64) -> WedgeGate {
     use std::sync::atomic::Ordering;
 
     if LEAKED_SCK_THREADS.load(Ordering::Acquire) >= MAX_LEAKED_SCK_THREADS {
-        return WedgeGate::Closed { permanent: true };
+        return WedgeGate::Closed { exhausted: true };
     }
     if WEDGED_SCK_CALLS.load(Ordering::Acquire) < MAX_WEDGED_SCK_CALLS {
         return WedgeGate::Open;
@@ -137,10 +180,10 @@ pub(crate) fn evaluate_wedge_gate(now_secs: u64) -> WedgeGate {
     if armed_at == 0 {
         // First tick at the cap: start the interval, stay shut.
         WEDGE_GATE_ARMED_AT.store(now_secs, Ordering::Release);
-        return WedgeGate::Closed { permanent: false };
+        return WedgeGate::Closed { exhausted: false };
     }
     if now_secs.saturating_sub(armed_at) < WEDGE_GATE_PROBE_INTERVAL.as_secs() {
-        return WedgeGate::Closed { permanent: false };
+        return WedgeGate::Closed { exhausted: false };
     }
 
     // Interval elapsed — let exactly one caller test the daemon.
@@ -148,7 +191,7 @@ pub(crate) fn evaluate_wedge_gate(now_secs: u64) -> WedgeGate {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return WedgeGate::Closed { permanent: false };
+        return WedgeGate::Closed { exhausted: false };
     }
     WEDGE_GATE_ARMED_AT.store(now_secs, Ordering::Release);
     WedgeGate::Probe
@@ -226,8 +269,8 @@ fn try_reserve_live_call(is_probe: bool) -> Result<(), usize> {
         .map(|_| ())
 }
 
-/// Run a closure that wraps a ScreenCaptureKit call on a worker thread and
-/// wait for it at most `timeout`.
+/// Run a synchronous bridge closure on a worker thread and wait for it at most
+/// `timeout`.
 ///
 /// ScreenCaptureKit completion handlers (`SCShareableContent`,
 /// `SCStream.startCapture`, `updateContentFilter`) can silently never fire —
@@ -236,21 +279,28 @@ fn try_reserve_live_call(is_probe: bool) -> Result<(), usize> {
 /// unbounded `join` there turns one wedged daemon callback into a total
 /// capture outage, so every SCK call goes through this bounded wait instead.
 ///
-/// On timeout the worker thread is intentionally leaked (there is no safe way
-/// to cancel a blocked ObjC completion wait); `WEDGED_SCK_CALLS` caps how many
-/// can pile up before callers fail fast.
+/// Every known callback future also goes through [`await_sck_callback`], whose
+/// earlier deadline drops the wait and lets this worker return. This outer
+/// bound remains a last-resort guard for runtime stalls and future call sites;
+/// if it expires, the worker cannot be forcibly killed safely and is accounted
+/// as leaked. `WEDGED_SCK_CALLS` caps how many can pile up before callers fail
+/// fast.
 ///
-/// Wedge accounting uses a per-call CAS handoff (`Pending` → `Completed` by
-/// the worker, `Pending` → `Abandoned` by the receiver) so exactly one side
-/// owns the outcome. The earlier send/recv-error protocol leaked a permanent
-/// wedged slot when the worker's send landed in the window between
-/// `recv_timeout` expiring and the receiver being dropped: the send succeeded
-/// (no decrement) while the receiver still incremented. Four such near-deadline
-/// completions would trip the fail-fast cap forever — turning the guard into a
-/// capture outage of its own.
-const WEDGE_PENDING: u8 = 0;
-const WEDGE_COMPLETED: u8 = 1;
-const WEDGE_ABANDONED: u8 = 2;
+/// Wedge accounting uses a per-call locked handoff (`Pending` → `Completed`
+/// by the worker, `Pending` → `Abandoned` by the receiver) so the state
+/// transition and its counter updates are one atomic decision.
+///
+/// A bare CAS is not enough here. Publishing `Abandoned` before charging the
+/// counters lets a just-completed worker observe the new state and decrement
+/// zero; the receiver then increments afterwards and leaves a false permanent
+/// leak. Holding this tiny mutex only around bookkeeping (never around the SCK
+/// call) closes both sides of the near-deadline race.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerHandoff {
+    Pending,
+    Completed,
+    Abandoned,
+}
 
 pub(crate) fn run_bounded<F, T>(
     name: &'static str,
@@ -261,8 +311,8 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     // Half-open breaker rather than a permanent gate: see
     // `WEDGE_GATE_PROBE_INTERVAL`.
@@ -276,11 +326,11 @@ where
             );
             true
         }
-        WedgeGate::Closed { permanent } => {
-            let reason = if permanent {
+        WedgeGate::Closed { exhausted } => {
+            let reason = if exhausted {
                 format!(
-                    "{MAX_LEAKED_SCK_THREADS} ScreenCaptureKit worker threads leaked; \
-                     the process must be restarted"
+                    "{MAX_LEAKED_SCK_THREADS} ScreenCaptureKit workers remain blocked; \
+                     refusing new calls until they return or the user reopens the app"
                 )
             } else {
                 format!(
@@ -319,46 +369,36 @@ where
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
-    let state = Arc::new(AtomicU8::new(WEDGE_PENDING));
+    let state = Arc::new(Mutex::new(WorkerHandoff::Pending));
     let worker_state = Arc::clone(&state);
     let spawn_result = std::thread::Builder::new()
         .name(format!("sck-{name}"))
         .spawn(move || {
             let result = panic::catch_unwind(panic::AssertUnwindSafe(f));
-            // Buffered send BEFORE the CAS: if the receiver observes
-            // `Completed`, the value is guaranteed to be in the channel.
-            let _ = tx.send(result);
-            if worker_state
-                .compare_exchange(
-                    WEDGE_PENDING,
-                    WEDGE_COMPLETED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                // Normal completion: the receiver never abandoned us, so we
-                // still own the live slot and release it here.
-                LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
-            } else {
-                // Receiver already abandoned us and counted a wedged slot —
-                // we completed after all, so clear it. The thread is no
-                // longer parked, so release its leak charge as well. It
-                // already released the live slot when it charged the leak,
-                // so releasing again here would underflow the counter.
-                //
-                // Saturating, because `reset_wedge_breaker` can zero
-                // `WEDGED_SCK_CALLS` while this thread is still parked: any
-                // successful call clears the breaker, and a wedged worker
-                // whose handler fires afterwards would then decrement past
-                // zero. On a `usize` that wraps to `usize::MAX`, which reads
-                // as "far above the wedge cap" and shuts the gate for the
-                // life of the process — the exact permanent outage the
-                // breaker exists to prevent, reached through its own
-                // recovery path.
-                decrement_saturating(&WEDGED_SCK_CALLS);
-                decrement_saturating(&LEAKED_SCK_THREADS);
+            let mut handoff = worker_state.lock().unwrap_or_else(|e| e.into_inner());
+            match *handoff {
+                WorkerHandoff::Pending => {
+                    // Normal completion: publish the value and release the
+                    // live slot before the receiver can return.
+                    *handoff = WorkerHandoff::Completed;
+                    LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
+                }
+                WorkerHandoff::Abandoned => {
+                    // Receiver already moved this worker from the live bound
+                    // to the wedge/leak bounds. It returned after charging
+                    // both counters under this same lock, so they are safe to
+                    // clear now. Do not release the live slot a second time.
+                    decrement_saturating(&WEDGED_SCK_CALLS);
+                    decrement_saturating(&LEAKED_SCK_THREADS);
+                }
+                WorkerHandoff::Completed => {
+                    debug_assert!(false, "ScreenCaptureKit worker completed twice");
+                }
             }
+            // Send while the handoff is locked. If a deadline raced this
+            // completion and observes `Completed`, the value is guaranteed
+            // to be buffered before it can call `try_recv`.
+            let _ = tx.send(result);
         });
     if let Err(e) = spawn_result {
         LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
@@ -392,16 +432,14 @@ where
             unpack(result)
         }
         Err(_) => {
-            match state.compare_exchange(
-                WEDGE_PENDING,
-                WEDGE_ABANDONED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
+            let mut handoff = state.lock().unwrap_or_else(|e| e.into_inner());
+            match *handoff {
+                WorkerHandoff::Pending => {
                     // We own the abandonment: the worker is still inside the
-                    // OS call. Count the wedged slot; the worker's failed CAS
-                    // clears it if the call ever completes.
+                    // OS call. Change state and counters under one lock so a
+                    // late completion cannot clear the counters before they
+                    // have been charged.
+                    *handoff = WorkerHandoff::Abandoned;
                     WEDGED_SCK_CALLS.fetch_add(1, Ordering::AcqRel);
                     LEAKED_SCK_THREADS.fetch_add(1, Ordering::AcqRel);
                     // Hand the thread from the concurrency bound to the leak
@@ -425,11 +463,10 @@ where
                         "{name}: timed out after {timeout:?} waiting for ScreenCaptureKit"
                     )))
                 }
-                Err(_) => {
+                WorkerHandoff::Completed => {
                     // The worker completed a hair after the deadline and won
-                    // the CAS — its result is already buffered. Take it
-                    // instead of reporting a spurious timeout (and instead of
-                    // leaking a wedged slot that would never be cleared).
+                    // the handoff. Its value was buffered under the same
+                    // lock, so take it instead of reporting a false timeout.
                     match rx.try_recv() {
                         Ok(result) => unpack(result),
                         Err(_) => Err(XCapError::capture_failed(format!(
@@ -437,14 +474,49 @@ where
                         ))),
                     }
                 }
+                WorkerHandoff::Abandoned => {
+                    debug_assert!(false, "ScreenCaptureKit worker abandoned twice");
+                    Err(XCapError::capture_failed(format!(
+                        "{name}: duplicate timeout handoff"
+                    )))
+                }
             }
         }
     }
 }
 
+/// Await a ScreenCaptureKit completion future for at most `timeout`.
+///
+/// cidre's completion future and its escaping Objective-C block share
+/// reference-counted state. Dropping the future at the deadline therefore
+/// stops waiting without invalidating a block still retained by the framework.
+/// This is the important inner bound: it lets the sync bridge worker return
+/// normally instead of parking one OS thread forever when a completion handler
+/// never fires.
+pub(crate) async fn await_sck_callback<F, T>(
+    name: &'static str,
+    timeout: Duration,
+    future: F,
+) -> XCapResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        XCapError::capture_failed(format!(
+            "{name}: callback timed out after {timeout:?} waiting for ScreenCaptureKit"
+        ))
+    })
+}
+
 /// Bound on a single `SCShareableContent` fetch. Long enough for a busy
 /// WindowServer, short enough that a wedged daemon can't freeze callers.
 pub(crate) const SHAREABLE_CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Fires before the outer worker bound so the callback future is dropped and
+/// the worker has time to return normally.
+const SHAREABLE_CONTENT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(4);
+/// One-shot screenshot callbacks can legitimately take longer than content
+/// enumeration on a busy high-resolution display.
+const SCREENSHOT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(8);
 
 // CoreGraphics FFI for display enumeration fallback
 extern "C" {
@@ -474,7 +546,13 @@ fn cg_online_display_count() -> u32 {
 fn fetch_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
     run_bounded("shareable-content", SHAREABLE_CONTENT_TIMEOUT, || {
         block_on(async {
-            sc::ShareableContent::current().await.map_err(|e| {
+            await_sck_callback(
+                "shareable-content",
+                SHAREABLE_CONTENT_CALLBACK_TIMEOUT,
+                sc::ShareableContent::current(),
+            )
+            .await?
+            .map_err(|e| {
                 let err_str = format!("{:?}", e);
                 if err_str.contains("permission")
                     || err_str.contains("denied")
@@ -723,7 +801,7 @@ pub fn capture_window_sync(window_id: u32, width: u32, height: u32) -> XCapResul
     // nested block_on) and immune to SCK completion handlers that never fire.
     run_bounded(
         "window-capture",
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(15),
         move || block_on(capture_window_async(window_id, width, height)),
     )?
 }
@@ -731,9 +809,13 @@ pub fn capture_window_sync(window_id: u32, width: u32, height: u32) -> XCapResul
 /// Async version of window capture
 async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCapResult<RgbaImage> {
     // Get shareable content
-    let content = sc::ShareableContent::current().await.map_err(|e| {
-        XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e))
-    })?;
+    let content = await_sck_callback(
+        "window-shareable-content",
+        SHAREABLE_CONTENT_CALLBACK_TIMEOUT,
+        sc::ShareableContent::current(),
+    )
+    .await?
+    .map_err(|e| XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e)))?;
 
     // Find the window
     let windows = content.windows();
@@ -794,9 +876,13 @@ async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCap
     cfg.set_scales_to_fit(false); // Don't scale, capture at native resolution
 
     // Use ScreenshotManager for single frame capture (macOS 14.0+)
-    let sample_buf = sc::ScreenshotManager::capture_sample_buf(&filter, &cfg)
-        .await
-        .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
+    let sample_buf = await_sck_callback(
+        "window-screenshot",
+        SCREENSHOT_CALLBACK_TIMEOUT,
+        sc::ScreenshotManager::capture_sample_buf(&filter, &cfg),
+    )
+    .await?
+    .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
 
     // Get the image buffer from the sample buffer
     let mut image_buf = sample_buf
@@ -940,9 +1026,13 @@ async fn capture_monitor_oneshot(
     height: u32,
     excluded_window_ids: &[u32],
 ) -> XCapResult<RgbaImage> {
-    let content = sc::ShareableContent::current().await.map_err(|e| {
-        XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e))
-    })?;
+    let content = await_sck_callback(
+        "monitor-shareable-content",
+        SHAREABLE_CONTENT_CALLBACK_TIMEOUT,
+        sc::ShareableContent::current(),
+    )
+    .await?
+    .map_err(|e| XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e)))?;
 
     let displays = content.displays();
     let display = displays
@@ -967,9 +1057,13 @@ async fn capture_monitor_oneshot(
         monitor_id, width, height
     );
 
-    let sample_buf = sc::ScreenshotManager::capture_sample_buf(&filter, &cfg)
-        .await
-        .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
+    let sample_buf = await_sck_callback(
+        "monitor-screenshot",
+        SCREENSHOT_CALLBACK_TIMEOUT,
+        sc::ScreenshotManager::capture_sample_buf(&filter, &cfg),
+    )
+    .await?
+    .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
 
     let mut image_buf = sample_buf
         .image_buf()
@@ -999,6 +1093,90 @@ mod tests {
     use super::lock_sck_globals;
 
     #[test]
+    fn callback_timeout_drops_the_waiting_future() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let future_dropped = Arc::clone(&dropped);
+        let result = block_on(await_sck_callback(
+            "test-callback",
+            Duration::from_millis(25),
+            async move {
+                let _signal = DropSignal(future_dropped);
+                std::future::pending::<()>().await;
+            },
+        ));
+
+        let error = result.expect_err("a never-firing callback must time out");
+        assert!(format!("{error}").contains("callback timed out"));
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the callback future must be dropped at its deadline"
+        );
+    }
+
+    #[test]
+    fn callback_timeout_returns_the_sync_worker_before_its_outer_deadline() {
+        use std::sync::atomic::Ordering;
+        let _guard = lock_sck_globals();
+        reset_gate_state_for_test();
+
+        let result = run_bounded("test-sync-bridge", Duration::from_millis(500), || {
+            block_on(await_sck_callback(
+                "test-callback",
+                Duration::from_millis(25),
+                std::future::pending::<()>(),
+            ))
+        });
+
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "the inner callback deadline should return through the worker: {result:?}"
+        );
+        assert_eq!(process_status(), ProcessStatus::Ready);
+        assert_eq!(WEDGED_SCK_CALLS.load(Ordering::Acquire), 0);
+        assert_eq!(LEAKED_SCK_THREADS.load(Ordering::Acquire), 0);
+        assert_eq!(LIVE_SCK_CALLS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn process_status_distinguishes_ready_degraded_and_exhausted() {
+        use std::sync::atomic::Ordering;
+        let _guard = lock_sck_globals();
+        reset_gate_state_for_test();
+
+        assert_eq!(process_status(), ProcessStatus::Ready);
+
+        WEDGED_SCK_CALLS.store(2, Ordering::Release);
+        LEAKED_SCK_THREADS.store(3, Ordering::Release);
+        assert_eq!(
+            process_status(),
+            ProcessStatus::Degraded {
+                wedged_calls: 2,
+                leaked_worker_threads: 3,
+            }
+        );
+
+        LEAKED_SCK_THREADS.store(MAX_LEAKED_SCK_THREADS, Ordering::Release);
+        assert_eq!(
+            process_status(),
+            ProcessStatus::Exhausted {
+                leaked_worker_threads: MAX_LEAKED_SCK_THREADS,
+            }
+        );
+
+        reset_gate_state_for_test();
+    }
+
+    #[test]
     fn run_bounded_returns_value_on_completion() {
         let _guard = lock_sck_globals();
         let result = run_bounded("test-ok", std::time::Duration::from_secs(5), || 42u32);
@@ -1010,7 +1188,7 @@ mod tests {
     /// leaks would trip the fail-fast cap and kill all SCK capture until app
     /// restart). Deterministic: the closure blocks until the test has
     /// observed the timeout, so the abandon-then-complete interleaving is
-    /// forced; the worker's failed CAS must clear the slot it was counted in.
+    /// forced; the worker handoff must clear the slot it was counted in.
     #[test]
     fn run_bounded_late_completion_clears_its_wedged_slot() {
         use std::sync::atomic::Ordering;
@@ -1034,7 +1212,7 @@ mod tests {
             "abandoned worker must be counted"
         );
 
-        // Let the worker complete; its failed CAS must clear the slot.
+        // Let the worker complete; its handoff must clear the slot.
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while WEDGED_SCK_CALLS.load(Ordering::Acquire) != baseline {
@@ -1048,8 +1226,8 @@ mod tests {
 
     /// Hammer the near-deadline window: many workers finishing a few ms after
     /// the timeout. Under the old send/recv-error protocol some of these
-    /// leaked permanent wedged slots; the CAS handoff must always drain back
-    /// to the baseline.
+    /// leaked permanent wedged slots; the locked handoff must always drain
+    /// back to the baseline.
     #[test]
     fn run_bounded_near_deadline_completions_never_leak_wedged_slots() {
         use std::sync::atomic::Ordering;
@@ -1550,12 +1728,12 @@ mod tests {
         // First tick at the cap arms the interval and stays shut.
         assert_eq!(
             evaluate_wedge_gate(t0),
-            WedgeGate::Closed { permanent: false }
+            WedgeGate::Closed { exhausted: false }
         );
         // Still inside the interval.
         assert_eq!(
             evaluate_wedge_gate(t0 + WEDGE_GATE_PROBE_INTERVAL.as_secs() - 1),
-            WedgeGate::Closed { permanent: false }
+            WedgeGate::Closed { exhausted: false }
         );
         // Interval elapsed: exactly one caller gets the probe.
         assert_eq!(
@@ -1565,7 +1743,7 @@ mod tests {
         // A concurrent caller in the same window does not also probe.
         assert_eq!(
             evaluate_wedge_gate(t0 + WEDGE_GATE_PROBE_INTERVAL.as_secs()),
-            WedgeGate::Closed { permanent: false }
+            WedgeGate::Closed { exhausted: false }
         );
 
         reset_gate_state_for_test();
@@ -1595,7 +1773,7 @@ mod tests {
     /// NOT cleared by a success: those threads are still parked. Only the hard
     /// ceiling stops a multi-hour outage from leaking without bound.
     #[test]
-    fn leaked_thread_ceiling_is_permanent_and_survives_a_success() {
+    fn parked_worker_ceiling_is_not_cleared_by_an_unrelated_success() {
         let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         reset_gate_state_for_test();
@@ -1603,14 +1781,14 @@ mod tests {
         LEAKED_SCK_THREADS.store(MAX_LEAKED_SCK_THREADS, Ordering::Release);
         assert_eq!(
             evaluate_wedge_gate(1),
-            WedgeGate::Closed { permanent: true },
+            WedgeGate::Closed { exhausted: true },
             "the leak ceiling must not be probe-recoverable"
         );
 
         reset_wedge_breaker();
         assert_eq!(
             evaluate_wedge_gate(2),
-            WedgeGate::Closed { permanent: true },
+            WedgeGate::Closed { exhausted: true },
             "clearing the breaker must not forget parked threads"
         );
 

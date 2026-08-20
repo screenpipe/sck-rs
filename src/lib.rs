@@ -39,6 +39,7 @@ mod monitor;
 mod stream_manager;
 mod window;
 
+pub use capture::{process_status, ProcessStatus};
 pub use error::{XCapError, XCapResult};
 pub use monitor::Monitor;
 pub use stream_manager::{
