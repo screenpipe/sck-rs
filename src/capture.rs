@@ -78,10 +78,10 @@ static WEDGED_SCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// daemon outage, one wedge away from disabling capture until relaunch.
 const WEDGE_GATE_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Hard ceiling on threads leaked across the process lifetime. The probe below
+/// Hard ceiling on worker threads that are still parked past their deadline. The probe below
 /// leaks at most one thread per `WEDGE_GATE_PROBE_INTERVAL` while the daemon
 /// stays dead, so this is what stops a multi-hour outage from leaking without
-/// bound. Reaching it means the process genuinely needs a restart.
+/// bound. Calls remain disabled at the ceiling unless parked workers return.
 const MAX_LEAKED_SCK_THREADS: usize = 32;
 
 /// Unix seconds when the wedged cap was last observed, or 0 if never. Drives
@@ -93,8 +93,8 @@ static WEDGE_GATE_ARMED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static WEDGE_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Threads leaked since process start and never recovered. Only ever
-/// decremented by a late completion, exactly like `WEDGED_SCK_CALLS`.
+/// Workers currently parked past their deadline. Decremented by a late
+/// completion, exactly like `WEDGED_SCK_CALLS`.
 static LEAKED_SCK_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Process-wide state of the sync worker containment layer.
@@ -113,8 +113,8 @@ pub enum ProcessStatus {
         wedged_calls: usize,
         leaked_worker_threads: usize,
     },
-    /// The hard process-lifetime worker ceiling has been reached. Further
-    /// calls are refused so the process cannot leak threads without bound.
+    /// The hard parked-worker ceiling has been reached. Further calls are
+    /// refused so the process cannot leak threads without bound.
     Exhausted { leaked_worker_threads: usize },
 }
 
@@ -155,8 +155,9 @@ pub(crate) enum WedgeGate {
     /// the single probe. It must clear `WEDGE_PROBE_IN_FLIGHT` when done.
     Probe,
     /// Over the cap and the interval has not elapsed, or another probe owns
-    /// this window, or the process has leaked too many threads to continue.
-    Closed { permanent: bool },
+    /// this window. `exhausted` means too many workers remain parked to admit
+    /// even a probe; a late completion can still bring the count below it.
+    Closed { exhausted: bool },
 }
 
 /// Decide whether a call may proceed, clock injected for testing.
@@ -169,7 +170,7 @@ pub(crate) fn evaluate_wedge_gate(now_secs: u64) -> WedgeGate {
     use std::sync::atomic::Ordering;
 
     if LEAKED_SCK_THREADS.load(Ordering::Acquire) >= MAX_LEAKED_SCK_THREADS {
-        return WedgeGate::Closed { permanent: true };
+        return WedgeGate::Closed { exhausted: true };
     }
     if WEDGED_SCK_CALLS.load(Ordering::Acquire) < MAX_WEDGED_SCK_CALLS {
         return WedgeGate::Open;
@@ -179,10 +180,10 @@ pub(crate) fn evaluate_wedge_gate(now_secs: u64) -> WedgeGate {
     if armed_at == 0 {
         // First tick at the cap: start the interval, stay shut.
         WEDGE_GATE_ARMED_AT.store(now_secs, Ordering::Release);
-        return WedgeGate::Closed { permanent: false };
+        return WedgeGate::Closed { exhausted: false };
     }
     if now_secs.saturating_sub(armed_at) < WEDGE_GATE_PROBE_INTERVAL.as_secs() {
-        return WedgeGate::Closed { permanent: false };
+        return WedgeGate::Closed { exhausted: false };
     }
 
     // Interval elapsed — let exactly one caller test the daemon.
@@ -190,7 +191,7 @@ pub(crate) fn evaluate_wedge_gate(now_secs: u64) -> WedgeGate {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return WedgeGate::Closed { permanent: false };
+        return WedgeGate::Closed { exhausted: false };
     }
     WEDGE_GATE_ARMED_AT.store(now_secs, Ordering::Release);
     WedgeGate::Probe
@@ -285,17 +286,21 @@ fn try_reserve_live_call(is_probe: bool) -> Result<(), usize> {
 /// as leaked. `WEDGED_SCK_CALLS` caps how many can pile up before callers fail
 /// fast.
 ///
-/// Wedge accounting uses a per-call CAS handoff (`Pending` → `Completed` by
-/// the worker, `Pending` → `Abandoned` by the receiver) so exactly one side
-/// owns the outcome. The earlier send/recv-error protocol leaked a permanent
-/// wedged slot when the worker's send landed in the window between
-/// `recv_timeout` expiring and the receiver being dropped: the send succeeded
-/// (no decrement) while the receiver still incremented. Four such near-deadline
-/// completions would trip the fail-fast cap forever — turning the guard into a
-/// capture outage of its own.
-const WEDGE_PENDING: u8 = 0;
-const WEDGE_COMPLETED: u8 = 1;
-const WEDGE_ABANDONED: u8 = 2;
+/// Wedge accounting uses a per-call locked handoff (`Pending` → `Completed`
+/// by the worker, `Pending` → `Abandoned` by the receiver) so the state
+/// transition and its counter updates are one atomic decision.
+///
+/// A bare CAS is not enough here. Publishing `Abandoned` before charging the
+/// counters lets a just-completed worker observe the new state and decrement
+/// zero; the receiver then increments afterwards and leaves a false permanent
+/// leak. Holding this tiny mutex only around bookkeeping (never around the SCK
+/// call) closes both sides of the near-deadline race.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerHandoff {
+    Pending,
+    Completed,
+    Abandoned,
+}
 
 pub(crate) fn run_bounded<F, T>(
     name: &'static str,
@@ -306,8 +311,8 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     // Half-open breaker rather than a permanent gate: see
     // `WEDGE_GATE_PROBE_INTERVAL`.
@@ -321,11 +326,11 @@ where
             );
             true
         }
-        WedgeGate::Closed { permanent } => {
-            let reason = if permanent {
+        WedgeGate::Closed { exhausted } => {
+            let reason = if exhausted {
                 format!(
-                    "{MAX_LEAKED_SCK_THREADS} ScreenCaptureKit worker threads leaked; \
-                     the process must be restarted"
+                    "{MAX_LEAKED_SCK_THREADS} ScreenCaptureKit workers remain blocked; \
+                     refusing new calls until they return or the user reopens the app"
                 )
             } else {
                 format!(
@@ -364,46 +369,36 @@ where
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
-    let state = Arc::new(AtomicU8::new(WEDGE_PENDING));
+    let state = Arc::new(Mutex::new(WorkerHandoff::Pending));
     let worker_state = Arc::clone(&state);
     let spawn_result = std::thread::Builder::new()
         .name(format!("sck-{name}"))
         .spawn(move || {
             let result = panic::catch_unwind(panic::AssertUnwindSafe(f));
-            // Buffered send BEFORE the CAS: if the receiver observes
-            // `Completed`, the value is guaranteed to be in the channel.
-            let _ = tx.send(result);
-            if worker_state
-                .compare_exchange(
-                    WEDGE_PENDING,
-                    WEDGE_COMPLETED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                // Normal completion: the receiver never abandoned us, so we
-                // still own the live slot and release it here.
-                LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
-            } else {
-                // Receiver already abandoned us and counted a wedged slot —
-                // we completed after all, so clear it. The thread is no
-                // longer parked, so release its leak charge as well. It
-                // already released the live slot when it charged the leak,
-                // so releasing again here would underflow the counter.
-                //
-                // Saturating, because `reset_wedge_breaker` can zero
-                // `WEDGED_SCK_CALLS` while this thread is still parked: any
-                // successful call clears the breaker, and a wedged worker
-                // whose handler fires afterwards would then decrement past
-                // zero. On a `usize` that wraps to `usize::MAX`, which reads
-                // as "far above the wedge cap" and shuts the gate for the
-                // life of the process — the exact permanent outage the
-                // breaker exists to prevent, reached through its own
-                // recovery path.
-                decrement_saturating(&WEDGED_SCK_CALLS);
-                decrement_saturating(&LEAKED_SCK_THREADS);
+            let mut handoff = worker_state.lock().unwrap_or_else(|e| e.into_inner());
+            match *handoff {
+                WorkerHandoff::Pending => {
+                    // Normal completion: publish the value and release the
+                    // live slot before the receiver can return.
+                    *handoff = WorkerHandoff::Completed;
+                    LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
+                }
+                WorkerHandoff::Abandoned => {
+                    // Receiver already moved this worker from the live bound
+                    // to the wedge/leak bounds. It returned after charging
+                    // both counters under this same lock, so they are safe to
+                    // clear now. Do not release the live slot a second time.
+                    decrement_saturating(&WEDGED_SCK_CALLS);
+                    decrement_saturating(&LEAKED_SCK_THREADS);
+                }
+                WorkerHandoff::Completed => {
+                    debug_assert!(false, "ScreenCaptureKit worker completed twice");
+                }
             }
+            // Send while the handoff is locked. If a deadline raced this
+            // completion and observes `Completed`, the value is guaranteed
+            // to be buffered before it can call `try_recv`.
+            let _ = tx.send(result);
         });
     if let Err(e) = spawn_result {
         LIVE_SCK_CALLS.fetch_sub(1, Ordering::AcqRel);
@@ -437,16 +432,14 @@ where
             unpack(result)
         }
         Err(_) => {
-            match state.compare_exchange(
-                WEDGE_PENDING,
-                WEDGE_ABANDONED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
+            let mut handoff = state.lock().unwrap_or_else(|e| e.into_inner());
+            match *handoff {
+                WorkerHandoff::Pending => {
                     // We own the abandonment: the worker is still inside the
-                    // OS call. Count the wedged slot; the worker's failed CAS
-                    // clears it if the call ever completes.
+                    // OS call. Change state and counters under one lock so a
+                    // late completion cannot clear the counters before they
+                    // have been charged.
+                    *handoff = WorkerHandoff::Abandoned;
                     WEDGED_SCK_CALLS.fetch_add(1, Ordering::AcqRel);
                     LEAKED_SCK_THREADS.fetch_add(1, Ordering::AcqRel);
                     // Hand the thread from the concurrency bound to the leak
@@ -470,17 +463,22 @@ where
                         "{name}: timed out after {timeout:?} waiting for ScreenCaptureKit"
                     )))
                 }
-                Err(_) => {
+                WorkerHandoff::Completed => {
                     // The worker completed a hair after the deadline and won
-                    // the CAS — its result is already buffered. Take it
-                    // instead of reporting a spurious timeout (and instead of
-                    // leaking a wedged slot that would never be cleared).
+                    // the handoff. Its value was buffered under the same
+                    // lock, so take it instead of reporting a false timeout.
                     match rx.try_recv() {
                         Ok(result) => unpack(result),
                         Err(_) => Err(XCapError::capture_failed(format!(
                             "{name}: worker completed at the deadline but its result was lost"
                         ))),
                     }
+                }
+                WorkerHandoff::Abandoned => {
+                    debug_assert!(false, "ScreenCaptureKit worker abandoned twice");
+                    Err(XCapError::capture_failed(format!(
+                        "{name}: duplicate timeout handoff"
+                    )))
                 }
             }
         }
@@ -1190,7 +1188,7 @@ mod tests {
     /// leaks would trip the fail-fast cap and kill all SCK capture until app
     /// restart). Deterministic: the closure blocks until the test has
     /// observed the timeout, so the abandon-then-complete interleaving is
-    /// forced; the worker's failed CAS must clear the slot it was counted in.
+    /// forced; the worker handoff must clear the slot it was counted in.
     #[test]
     fn run_bounded_late_completion_clears_its_wedged_slot() {
         use std::sync::atomic::Ordering;
@@ -1214,7 +1212,7 @@ mod tests {
             "abandoned worker must be counted"
         );
 
-        // Let the worker complete; its failed CAS must clear the slot.
+        // Let the worker complete; its handoff must clear the slot.
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while WEDGED_SCK_CALLS.load(Ordering::Acquire) != baseline {
@@ -1228,8 +1226,8 @@ mod tests {
 
     /// Hammer the near-deadline window: many workers finishing a few ms after
     /// the timeout. Under the old send/recv-error protocol some of these
-    /// leaked permanent wedged slots; the CAS handoff must always drain back
-    /// to the baseline.
+    /// leaked permanent wedged slots; the locked handoff must always drain
+    /// back to the baseline.
     #[test]
     fn run_bounded_near_deadline_completions_never_leak_wedged_slots() {
         use std::sync::atomic::Ordering;
@@ -1730,12 +1728,12 @@ mod tests {
         // First tick at the cap arms the interval and stays shut.
         assert_eq!(
             evaluate_wedge_gate(t0),
-            WedgeGate::Closed { permanent: false }
+            WedgeGate::Closed { exhausted: false }
         );
         // Still inside the interval.
         assert_eq!(
             evaluate_wedge_gate(t0 + WEDGE_GATE_PROBE_INTERVAL.as_secs() - 1),
-            WedgeGate::Closed { permanent: false }
+            WedgeGate::Closed { exhausted: false }
         );
         // Interval elapsed: exactly one caller gets the probe.
         assert_eq!(
@@ -1745,7 +1743,7 @@ mod tests {
         // A concurrent caller in the same window does not also probe.
         assert_eq!(
             evaluate_wedge_gate(t0 + WEDGE_GATE_PROBE_INTERVAL.as_secs()),
-            WedgeGate::Closed { permanent: false }
+            WedgeGate::Closed { exhausted: false }
         );
 
         reset_gate_state_for_test();
@@ -1775,7 +1773,7 @@ mod tests {
     /// NOT cleared by a success: those threads are still parked. Only the hard
     /// ceiling stops a multi-hour outage from leaking without bound.
     #[test]
-    fn leaked_thread_ceiling_is_permanent_and_survives_a_success() {
+    fn parked_worker_ceiling_is_not_cleared_by_an_unrelated_success() {
         let _guard = lock_sck_globals();
         use std::sync::atomic::Ordering;
         reset_gate_state_for_test();
@@ -1783,14 +1781,14 @@ mod tests {
         LEAKED_SCK_THREADS.store(MAX_LEAKED_SCK_THREADS, Ordering::Release);
         assert_eq!(
             evaluate_wedge_gate(1),
-            WedgeGate::Closed { permanent: true },
+            WedgeGate::Closed { exhausted: true },
             "the leak ceiling must not be probe-recoverable"
         );
 
         reset_wedge_breaker();
         assert_eq!(
             evaluate_wedge_gate(2),
-            WedgeGate::Closed { permanent: true },
+            WedgeGate::Closed { exhausted: true },
             "clearing the breaker must not forget parked threads"
         );
 
