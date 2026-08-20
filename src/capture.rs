@@ -97,6 +97,48 @@ static WEDGE_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
 /// decremented by a late completion, exactly like `WEDGED_SCK_CALLS`.
 static LEAKED_SCK_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Process-wide state of the sync worker containment layer.
+///
+/// Known ScreenCaptureKit completion futures are cancelled at their own
+/// deadlines before the worker deadline expires. This status therefore
+/// describes the last-resort worker guard, not ordinary callback timeouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessStatus {
+    /// No worker has outlived its deadline.
+    Ready,
+    /// At least one worker outlived its deadline, but calls can still be
+    /// admitted (possibly through the half-open recovery probe).
+    Degraded {
+        wedged_calls: usize,
+        leaked_worker_threads: usize,
+    },
+    /// The hard process-lifetime worker ceiling has been reached. Further
+    /// calls are refused so the process cannot leak threads without bound.
+    Exhausted { leaked_worker_threads: usize },
+}
+
+/// Return the current process-wide worker containment state.
+pub fn process_status() -> ProcessStatus {
+    use std::sync::atomic::Ordering;
+
+    let leaked_worker_threads = LEAKED_SCK_THREADS.load(Ordering::Acquire);
+    if leaked_worker_threads >= MAX_LEAKED_SCK_THREADS {
+        return ProcessStatus::Exhausted {
+            leaked_worker_threads,
+        };
+    }
+    let wedged_calls = WEDGED_SCK_CALLS.load(Ordering::Acquire);
+    if wedged_calls > 0 || leaked_worker_threads > 0 {
+        ProcessStatus::Degraded {
+            wedged_calls,
+            leaked_worker_threads,
+        }
+    } else {
+        ProcessStatus::Ready
+    }
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -226,8 +268,8 @@ fn try_reserve_live_call(is_probe: bool) -> Result<(), usize> {
         .map(|_| ())
 }
 
-/// Run a closure that wraps a ScreenCaptureKit call on a worker thread and
-/// wait for it at most `timeout`.
+/// Run a synchronous bridge closure on a worker thread and wait for it at most
+/// `timeout`.
 ///
 /// ScreenCaptureKit completion handlers (`SCShareableContent`,
 /// `SCStream.startCapture`, `updateContentFilter`) can silently never fire —
@@ -236,9 +278,12 @@ fn try_reserve_live_call(is_probe: bool) -> Result<(), usize> {
 /// unbounded `join` there turns one wedged daemon callback into a total
 /// capture outage, so every SCK call goes through this bounded wait instead.
 ///
-/// On timeout the worker thread is intentionally leaked (there is no safe way
-/// to cancel a blocked ObjC completion wait); `WEDGED_SCK_CALLS` caps how many
-/// can pile up before callers fail fast.
+/// Every known callback future also goes through [`await_sck_callback`], whose
+/// earlier deadline drops the wait and lets this worker return. This outer
+/// bound remains a last-resort guard for runtime stalls and future call sites;
+/// if it expires, the worker cannot be forcibly killed safely and is accounted
+/// as leaked. `WEDGED_SCK_CALLS` caps how many can pile up before callers fail
+/// fast.
 ///
 /// Wedge accounting uses a per-call CAS handoff (`Pending` → `Completed` by
 /// the worker, `Pending` → `Abandoned` by the receiver) so exactly one side
@@ -442,9 +487,38 @@ where
     }
 }
 
+/// Await a ScreenCaptureKit completion future for at most `timeout`.
+///
+/// cidre's completion future and its escaping Objective-C block share
+/// reference-counted state. Dropping the future at the deadline therefore
+/// stops waiting without invalidating a block still retained by the framework.
+/// This is the important inner bound: it lets the sync bridge worker return
+/// normally instead of parking one OS thread forever when a completion handler
+/// never fires.
+pub(crate) async fn await_sck_callback<F, T>(
+    name: &'static str,
+    timeout: Duration,
+    future: F,
+) -> XCapResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        XCapError::capture_failed(format!(
+            "{name}: callback timed out after {timeout:?} waiting for ScreenCaptureKit"
+        ))
+    })
+}
+
 /// Bound on a single `SCShareableContent` fetch. Long enough for a busy
 /// WindowServer, short enough that a wedged daemon can't freeze callers.
 pub(crate) const SHAREABLE_CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Fires before the outer worker bound so the callback future is dropped and
+/// the worker has time to return normally.
+const SHAREABLE_CONTENT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(4);
+/// One-shot screenshot callbacks can legitimately take longer than content
+/// enumeration on a busy high-resolution display.
+const SCREENSHOT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(8);
 
 // CoreGraphics FFI for display enumeration fallback
 extern "C" {
@@ -474,7 +548,13 @@ fn cg_online_display_count() -> u32 {
 fn fetch_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
     run_bounded("shareable-content", SHAREABLE_CONTENT_TIMEOUT, || {
         block_on(async {
-            sc::ShareableContent::current().await.map_err(|e| {
+            await_sck_callback(
+                "shareable-content",
+                SHAREABLE_CONTENT_CALLBACK_TIMEOUT,
+                sc::ShareableContent::current(),
+            )
+            .await?
+            .map_err(|e| {
                 let err_str = format!("{:?}", e);
                 if err_str.contains("permission")
                     || err_str.contains("denied")
@@ -723,7 +803,7 @@ pub fn capture_window_sync(window_id: u32, width: u32, height: u32) -> XCapResul
     // nested block_on) and immune to SCK completion handlers that never fire.
     run_bounded(
         "window-capture",
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(15),
         move || block_on(capture_window_async(window_id, width, height)),
     )?
 }
@@ -731,9 +811,13 @@ pub fn capture_window_sync(window_id: u32, width: u32, height: u32) -> XCapResul
 /// Async version of window capture
 async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCapResult<RgbaImage> {
     // Get shareable content
-    let content = sc::ShareableContent::current().await.map_err(|e| {
-        XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e))
-    })?;
+    let content = await_sck_callback(
+        "window-shareable-content",
+        SHAREABLE_CONTENT_CALLBACK_TIMEOUT,
+        sc::ShareableContent::current(),
+    )
+    .await?
+    .map_err(|e| XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e)))?;
 
     // Find the window
     let windows = content.windows();
@@ -794,9 +878,13 @@ async fn capture_window_async(window_id: u32, _width: u32, _height: u32) -> XCap
     cfg.set_scales_to_fit(false); // Don't scale, capture at native resolution
 
     // Use ScreenshotManager for single frame capture (macOS 14.0+)
-    let sample_buf = sc::ScreenshotManager::capture_sample_buf(&filter, &cfg)
-        .await
-        .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
+    let sample_buf = await_sck_callback(
+        "window-screenshot",
+        SCREENSHOT_CALLBACK_TIMEOUT,
+        sc::ScreenshotManager::capture_sample_buf(&filter, &cfg),
+    )
+    .await?
+    .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
 
     // Get the image buffer from the sample buffer
     let mut image_buf = sample_buf
@@ -940,9 +1028,13 @@ async fn capture_monitor_oneshot(
     height: u32,
     excluded_window_ids: &[u32],
 ) -> XCapResult<RgbaImage> {
-    let content = sc::ShareableContent::current().await.map_err(|e| {
-        XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e))
-    })?;
+    let content = await_sck_callback(
+        "monitor-shareable-content",
+        SHAREABLE_CONTENT_CALLBACK_TIMEOUT,
+        sc::ShareableContent::current(),
+    )
+    .await?
+    .map_err(|e| XCapError::capture_failed(format!("Failed to get shareable content: {:?}", e)))?;
 
     let displays = content.displays();
     let display = displays
@@ -967,9 +1059,13 @@ async fn capture_monitor_oneshot(
         monitor_id, width, height
     );
 
-    let sample_buf = sc::ScreenshotManager::capture_sample_buf(&filter, &cfg)
-        .await
-        .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
+    let sample_buf = await_sck_callback(
+        "monitor-screenshot",
+        SCREENSHOT_CALLBACK_TIMEOUT,
+        sc::ScreenshotManager::capture_sample_buf(&filter, &cfg),
+    )
+    .await?
+    .map_err(|e| XCapError::capture_failed(format!("Screenshot capture failed: {:?}", e)))?;
 
     let mut image_buf = sample_buf
         .image_buf()
@@ -997,6 +1093,90 @@ mod tests {
     /// not run concurrently with each other *or* with any other test that
     /// makes a real ScreenCaptureKit call. See [`SCK_GLOBAL_TEST_LOCK`].
     use super::lock_sck_globals;
+
+    #[test]
+    fn callback_timeout_drops_the_waiting_future() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let future_dropped = Arc::clone(&dropped);
+        let result = block_on(await_sck_callback(
+            "test-callback",
+            Duration::from_millis(25),
+            async move {
+                let _signal = DropSignal(future_dropped);
+                std::future::pending::<()>().await;
+            },
+        ));
+
+        let error = result.expect_err("a never-firing callback must time out");
+        assert!(format!("{error}").contains("callback timed out"));
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the callback future must be dropped at its deadline"
+        );
+    }
+
+    #[test]
+    fn callback_timeout_returns_the_sync_worker_before_its_outer_deadline() {
+        use std::sync::atomic::Ordering;
+        let _guard = lock_sck_globals();
+        reset_gate_state_for_test();
+
+        let result = run_bounded("test-sync-bridge", Duration::from_millis(500), || {
+            block_on(await_sck_callback(
+                "test-callback",
+                Duration::from_millis(25),
+                std::future::pending::<()>(),
+            ))
+        });
+
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "the inner callback deadline should return through the worker: {result:?}"
+        );
+        assert_eq!(process_status(), ProcessStatus::Ready);
+        assert_eq!(WEDGED_SCK_CALLS.load(Ordering::Acquire), 0);
+        assert_eq!(LEAKED_SCK_THREADS.load(Ordering::Acquire), 0);
+        assert_eq!(LIVE_SCK_CALLS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn process_status_distinguishes_ready_degraded_and_exhausted() {
+        use std::sync::atomic::Ordering;
+        let _guard = lock_sck_globals();
+        reset_gate_state_for_test();
+
+        assert_eq!(process_status(), ProcessStatus::Ready);
+
+        WEDGED_SCK_CALLS.store(2, Ordering::Release);
+        LEAKED_SCK_THREADS.store(3, Ordering::Release);
+        assert_eq!(
+            process_status(),
+            ProcessStatus::Degraded {
+                wedged_calls: 2,
+                leaked_worker_threads: 3,
+            }
+        );
+
+        LEAKED_SCK_THREADS.store(MAX_LEAKED_SCK_THREADS, Ordering::Release);
+        assert_eq!(
+            process_status(),
+            ProcessStatus::Exhausted {
+                leaked_worker_threads: MAX_LEAKED_SCK_THREADS,
+            }
+        );
+
+        reset_gate_state_for_test();
+    }
 
     #[test]
     fn run_bounded_returns_value_on_completion() {

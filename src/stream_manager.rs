@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::capture::{get_shareable_content, safe_image_buf_to_rgba};
+use crate::capture::{await_sck_callback, get_shareable_content, safe_image_buf_to_rgba};
 use crate::error::{XCapError, XCapResult};
 
 // ── Frame receiver (ObjC callback) ─────────────────────────────────
@@ -273,8 +273,12 @@ impl MonitorStream {
         // every capture path waiting on the stream map).
         let stream_clone = stream.retained();
         crate::capture::run_bounded("stream-start", Duration::from_secs(10), move || {
-            crate::capture::block_on(async { stream_clone.start().await })
+            crate::capture::block_on(async {
+                await_sck_callback("stream-start", Duration::from_secs(9), stream_clone.start())
+                    .await
+            })
         })
+        .map_err(|e| XCapError::capture_failed(format!("failed to start stream: {}", e)))?
         .map_err(|e| XCapError::capture_failed(format!("failed to start stream: {}", e)))?
         .map_err(|e| XCapError::capture_failed(format!("stream start error: {:?}", e)))?;
 
@@ -316,8 +320,16 @@ impl MonitorStream {
         filter: arc::R<sc::ContentFilter>,
     ) -> XCapResult<()> {
         crate::capture::run_bounded("filter-update", Duration::from_secs(5), move || {
-            crate::capture::block_on(async { stream.update_content_filter(&filter).await })
+            crate::capture::block_on(async {
+                await_sck_callback(
+                    "filter-update",
+                    Duration::from_secs(4),
+                    stream.update_content_filter(&filter),
+                )
+                .await
+            })
         })
+        .map_err(|e| XCapError::capture_failed(format!("failed to update content filter: {}", e)))?
         .map_err(|e| XCapError::capture_failed(format!("failed to update content filter: {}", e)))?
         .map_err(|e| XCapError::capture_failed(format!("update content filter error: {:?}", e)))
     }
