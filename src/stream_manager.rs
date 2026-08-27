@@ -38,13 +38,11 @@ struct FrameReceiverInner {
     /// recorder can consume every frame. `None` = the default latch mode used
     /// by the persistent screenshot stream.
     frame_tx: Option<tokio::sync::mpsc::Sender<RgbaImage>>,
-    /// Monotonic count of frames the OS callback has latched (latch mode only).
-    /// Bumped once per delivered frame, so a consumer can tell whether the
-    /// stream is still being fed: if this stops advancing while the stream is
-    /// alive, the OS callback has wedged and `latest_frame` is stale. A static
-    /// screen still advances it — ScreenCaptureKit delivers identical frames at
-    /// the frame interval — which is what makes "seq stalled" mean "frozen
-    /// stream", not "idle screen".
+    /// Monotonic count of screen callbacks observed (latch mode only). This is
+    /// bumped before looking for an image buffer because ScreenCaptureKit sends
+    /// idle updates without an IOSurface when the display has not changed. A
+    /// consumer can therefore distinguish a live idle stream from a callback
+    /// that has actually wedged.
     frame_seq: Arc<AtomicU64>,
 }
 
@@ -58,6 +56,15 @@ impl Output for FrameReceiver {}
 
 fn push_channel_accepts_frame(tx: &tokio::sync::mpsc::Sender<RgbaImage>) -> bool {
     tx.capacity() > 0
+}
+
+fn mark_latch_stream_callback(
+    frame_tx: Option<&tokio::sync::mpsc::Sender<RgbaImage>>,
+    frame_seq: &AtomicU64,
+) {
+    if frame_tx.is_none() {
+        frame_seq.fetch_add(1, Ordering::Release);
+    }
 }
 
 #[objc::add_methods]
@@ -87,6 +94,15 @@ impl OutputImpl for FrameReceiver {
             return;
         }
 
+        // An idle ScreenCaptureKit sample has no image buffer because there is
+        // no new IOSurface. It still proves the callback is alive, so advance
+        // liveness before the image-buffer early return. HD push streams do not
+        // expose this sequence and remain governed by channel backpressure.
+        {
+            let inner = self.inner_mut();
+            mark_latch_stream_callback(inner.frame_tx.as_ref(), &inner.frame_seq);
+        }
+
         // Extract image buffer from sample
         let Some(mut image_buf) = sample_buf.image_buf().map(|b| b.retained()) else {
             return;
@@ -114,9 +130,6 @@ impl OutputImpl for FrameReceiver {
         if let Ok(mut guard) = inner.latest_frame.lock() {
             *guard = Some(image);
         }
-        // Bump the delivery sequence so consumers can detect a wedged callback
-        // (seq stops advancing) vs. a static screen (seq keeps advancing).
-        inner.frame_seq.fetch_add(1, Ordering::Release);
         inner.frame_notify.notify_waiters();
     }
 }
@@ -338,7 +351,7 @@ impl MonitorStream {
         self.latest_frame.lock().ok()?.clone()
     }
 
-    /// Monotonic count of frames the OS callback has latched. See
+    /// Monotonic count of screen callbacks the OS has delivered. See
     /// `FrameReceiverInner::frame_seq`.
     fn frame_seq(&self) -> u64 {
         self.frame_seq.load(Ordering::Acquire)
@@ -819,15 +832,15 @@ pub fn stop_all_streams() {
 }
 
 /// Current frame-delivery sequence for a monitor's persistent stream, if one
-/// is cached. Monotonic; bumped once per OS-latched frame. `None` when no
-/// stream exists for this monitor yet.
+/// is cached. Monotonic; bumped once per screen callback, including idle
+/// updates that contain no new image buffer. `None` when no stream exists for
+/// this monitor yet.
 ///
 /// Compare it across captures: if it does not advance while captures keep
 /// happening, the stream's OS callback has wedged and
 /// `capture_monitor_persistent` is returning a stale frame — invalidate and
-/// recreate the stream. A static screen keeps advancing it (SCK delivers
-/// identical frames at the frame interval), so a stalled sequence means a dead
-/// stream, not an idle one.
+/// recreate the stream. A static screen keeps advancing it through SCK idle
+/// callbacks, so a stalled sequence means a dead callback, not an idle display.
 pub fn monitor_frame_seq(monitor_id: u32) -> Option<u64> {
     MANAGER
         .streams
@@ -961,6 +974,22 @@ mod stream_manager_regression_tests {
         assert!(
             push_channel_accepts_frame(&tx),
             "conversion can resume as soon as the recorder drains the handoff"
+        );
+    }
+
+    #[test]
+    fn idle_latch_callback_advances_liveness_without_an_image() {
+        let seq = AtomicU64::new(0);
+
+        mark_latch_stream_callback(None, &seq);
+        assert_eq!(seq.load(Ordering::Acquire), 1);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        mark_latch_stream_callback(Some(&tx), &seq);
+        assert_eq!(
+            seq.load(Ordering::Acquire),
+            1,
+            "HD push callbacks must not mutate the screenshot liveness sequence"
         );
     }
 
