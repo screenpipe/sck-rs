@@ -545,29 +545,55 @@ fn cg_online_display_count() -> u32 {
 /// call so a never-firing completion handler can't park the caller forever.
 fn fetch_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
     run_bounded("shareable-content", SHAREABLE_CONTENT_TIMEOUT, || {
-        block_on(async {
-            await_sck_callback(
-                "shareable-content",
-                SHAREABLE_CONTENT_CALLBACK_TIMEOUT,
-                sc::ShareableContent::current(),
-            )
-            .await?
-            .map_err(|e| {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("permission")
-                    || err_str.contains("denied")
-                    || err_str.contains("-3801")
-                {
-                    XCapError::permission_denied()
-                } else {
-                    XCapError::capture_failed(format!(
-                        "Failed to get shareable content: {}",
-                        err_str
-                    ))
-                }
-            })
-        })
+        block_on(fetch_shareable_content_async())
     })?
+}
+
+/// Fetch `SCShareableContent` without creating a synchronous bridge worker.
+///
+/// Async callers should use this path so cancelling at the callback deadline
+/// drops cidre's reference-counted waiter instead of abandoning an OS thread.
+async fn fetch_shareable_content_async() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    cidre::objc::ar_pool(|| {
+        sc::ShareableContent::current_with_ch(move |content, error| {
+            let result = match (content, error) {
+                (Some(content), _) => Ok(content.retained()),
+                (_, Some(error)) => {
+                    let err_str = format!("{:?}", error);
+                    if err_str.contains("permission")
+                        || err_str.contains("denied")
+                        || err_str.contains("-3801")
+                    {
+                        Err(XCapError::permission_denied())
+                    } else {
+                        Err(XCapError::capture_failed(format!(
+                            "Failed to get shareable content: {}",
+                            err_str
+                        )))
+                    }
+                }
+                (None, None) => Err(XCapError::capture_failed(
+                    "ScreenCaptureKit returned neither content nor an error",
+                )),
+            };
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(result);
+            }
+        });
+    });
+
+    match tokio::time::timeout(SHAREABLE_CONTENT_CALLBACK_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(XCapError::capture_failed(
+            "shareable-content callback channel closed before completion",
+        )),
+        Err(_) => Err(XCapError::capture_failed(format!(
+            "shareable-content: callback timed out after {:?} waiting for ScreenCaptureKit",
+            SHAREABLE_CONTENT_CALLBACK_TIMEOUT
+        ))),
+    }
 }
 
 /// Get shareable content synchronously.
@@ -606,6 +632,38 @@ pub fn get_shareable_content() -> XCapResult<cidre::arc::R<sc::ShareableContent>
     // Still empty after ~7s — return what we have (caller handles empty)
     debug!("SCK still empty after retries, returning empty content");
     fetch_shareable_content()
+}
+
+/// Get shareable content asynchronously without spawning a bridge worker.
+///
+/// This preserves the post-wake recovery policy of [`get_shareable_content`],
+/// but its delays and ScreenCaptureKit callback waits are cancellable futures.
+pub async fn get_shareable_content_async() -> XCapResult<cidre::arc::R<sc::ShareableContent>> {
+    let content = fetch_shareable_content_async().await?;
+    if !content.displays().is_empty() {
+        return Ok(content);
+    }
+
+    let cg_count = cg_online_display_count();
+    if cg_count == 0 {
+        return Ok(content);
+    }
+
+    debug!(
+        "SCK returned 0 displays but CG sees {} — retrying after wake",
+        cg_count
+    );
+    for delay_ms in [200, 500, 1000, 2000, 3000] {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let content = fetch_shareable_content_async().await?;
+        if !content.displays().is_empty() {
+            debug!("SCK recovered after {}ms delay", delay_ms);
+            return Ok(content);
+        }
+    }
+
+    debug!("SCK still empty after retries, returning empty content");
+    fetch_shareable_content_async().await
 }
 
 // FFI bindings for non-planar pixel buffer functions (not exposed by cidre)
