@@ -42,6 +42,21 @@ impl Monitor {
     pub fn all() -> XCapResult<Vec<Monitor>> {
         let content = capture::get_shareable_content()?;
 
+        Self::from_shareable_content(&content)
+    }
+
+    /// Get all available monitors without spawning a synchronous bridge worker.
+    pub async fn all_async() -> XCapResult<Vec<Monitor>> {
+        let content = capture::get_shareable_content_async().await?;
+
+        let mut result = None;
+        cidre::objc::ar_pool(|| {
+            result = Some(Self::from_shareable_content(&content));
+        });
+        result.expect("autorelease pool closure must run")
+    }
+
+    fn from_shareable_content(content: &cidre::sc::ShareableContent) -> XCapResult<Vec<Monitor>> {
         let displays = content.displays();
 
         if displays.is_empty() {
@@ -295,6 +310,12 @@ mod tests {
     fn test_monitor_all() {
         let _sck_guard = crate::capture::lock_sck_globals();
         let result = Monitor::all();
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn test_monitor_all_async() {
+        let result = Monitor::all_async().await;
         let _ = result;
     }
 }
