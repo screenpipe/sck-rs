@@ -192,9 +192,6 @@ static STREAM_STOP_LIMITER: StopLimiter = StopLimiter::new(MAX_PENDING_STREAM_ST
 
 // ── Per-monitor stream ─────────────────────────────────────────────
 
-/// Monotonic id source for `MonitorStream::generation`.
-static STREAM_GENERATION: AtomicU64 = AtomicU64::new(0);
-
 struct MonitorStream {
     _stream: arc::R<sc::Stream>,
     _output: arc::R<FrameReceiver>,
@@ -207,26 +204,6 @@ struct MonitorStream {
     height: u32,
     /// Sorted SCK window IDs currently excluded from this stream's ContentFilter.
     excluded_window_ids: Vec<u32>,
-    /// Identity token: exclusion updates are applied outside the map lock, so
-    /// the updater re-checks under the lock that the entry it fetched content
-    /// for is still the same stream before committing bookkeeping.
-    generation: u64,
-    /// Single-flight guard for filter updates. Updates run outside the map
-    /// lock, so without this two concurrent captures could interleave their
-    /// apply and commit phases (apply A, apply B, commit B, commit A) and
-    /// leave `excluded_window_ids` describing a filter the OS is not running.
-    filter_update_busy: Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// Clears a stream's filter-update busy flag on every exit path (including
-/// panics and early `?` returns) so a failed update can never wedge future
-/// updates behind a stuck flag.
-struct FilterUpdateGuard(Arc<std::sync::atomic::AtomicBool>);
-
-impl Drop for FilterUpdateGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }
 
 impl MonitorStream {
@@ -317,34 +294,7 @@ impl MonitorStream {
             width,
             height,
             excluded_window_ids: sorted_ids,
-            generation: STREAM_GENERATION.fetch_add(1, Ordering::Relaxed),
-            filter_update_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
-    }
-
-    /// Push a new ContentFilter to a running stream, bounded.
-    ///
-    /// Standalone (no `&self`) so `StreamManager::capture` can run it after
-    /// releasing the stream-map lock — `updateContentFilter`'s completion can
-    /// wedge exactly like the other SCK callbacks, and holding the map lock
-    /// across it froze every capture path in the process.
-    fn apply_content_filter(
-        stream: arc::R<sc::Stream>,
-        filter: arc::R<sc::ContentFilter>,
-    ) -> XCapResult<()> {
-        crate::capture::run_bounded("filter-update", Duration::from_secs(5), move || {
-            crate::capture::block_on(async {
-                await_sck_callback(
-                    "filter-update",
-                    Duration::from_secs(4),
-                    stream.update_content_filter(&filter),
-                )
-                .await
-            })
-        })
-        .map_err(|e| XCapError::capture_failed(format!("failed to update content filter: {}", e)))?
-        .map_err(|e| XCapError::capture_failed(format!("failed to update content filter: {}", e)))?
-        .map_err(|e| XCapError::capture_failed(format!("update content filter error: {:?}", e)))
     }
 
     fn latest_frame(&self) -> Option<RgbaImage> {
@@ -454,9 +404,9 @@ impl StreamManager {
     /// up to 3s for the first frame. Subsequent calls return the latest
     /// buffered frame immediately.
     ///
-    /// If `excluded_window_ids` changes, the content filter is updated
-    /// in-place on the running stream (no stop/start). The stream is only
-    /// fully recreated when resolution changes.
+    /// Exclusion changes create a new stream with its own empty frame buffer.
+    /// An in-place filter update completing does not prove the latched image
+    /// was captured with that filter; returning it can expose an excluded window.
     pub async fn capture(
         monitor_id: u32,
         width: u32,
@@ -481,18 +431,6 @@ impl StreamManager {
             Wait(Arc<tokio::sync::Notify>, Arc<Mutex<Option<RgbaImage>>>),
             /// Stream matches and a frame is latched.
             Done(RgbaImage),
-            /// Exclusion set changed — push a new filter outside the lock.
-            UpdateFilter {
-                stream: arc::R<sc::Stream>,
-                generation: u64,
-                fallback_frame: Option<RgbaImage>,
-                /// Cleared on every exit via `FilterUpdateGuard`.
-                busy: Arc<std::sync::atomic::AtomicBool>,
-                /// True when the new set excludes windows the current filter
-                /// does not — serving frames without them could leak content
-                /// the caller asked to hide, so failures must fail closed.
-                exclusions_added: bool,
-            },
         }
 
         let plan = {
@@ -514,32 +452,10 @@ impl StreamManager {
                     Some(frame) => Plan::Done(frame),
                     None => Plan::Wait(ms.frame_notify.clone(), ms.latest_frame.clone()),
                 },
-                Some(ms) => {
-                    // Single-flight: only one filter update per stream may be
-                    // in flight. A second caller serves the latched frame
-                    // (captured under the last COMMITTED filter) instead of
-                    // interleaving apply/commit phases with the first.
-                    if ms
-                        .filter_update_busy
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        match ms.latest_frame() {
-                            Some(frame) => Plan::Done(frame),
-                            None => Plan::Wait(ms.frame_notify.clone(), ms.latest_frame.clone()),
-                        }
-                    } else {
-                        Plan::UpdateFilter {
-                            stream: ms._stream.retained(),
-                            generation: ms.generation,
-                            fallback_frame: ms.latest_frame(),
-                            busy: ms.filter_update_busy.clone(),
-                            exclusions_added: sorted_input
-                                .iter()
-                                .any(|id| !ms.excluded_window_ids.contains(id)),
-                        }
-                    }
-                }
+                // Never relabel an existing buffer with new exclusions. A
+                // fresh stream keeps late callbacks from the old filter in
+                // that old stream's buffer, even while teardown completes.
+                Some(_) => Plan::Create,
             }
         };
 
@@ -547,103 +463,6 @@ impl StreamManager {
             Plan::Done(frame) => return Ok(frame),
             Plan::Wait(notify, latest) => return Self::wait_for_frame(notify, latest).await,
             Plan::Create => {}
-            Plan::UpdateFilter {
-                stream,
-                generation,
-                fallback_frame,
-                busy,
-                exclusions_added,
-            } => {
-                // Cleared on every exit path — a failed or panicking update
-                // must never wedge future updates behind a stuck busy flag.
-                let _busy_guard = FilterUpdateGuard(busy);
-
-                // Phase 2 — all SCK work outside the lock, bounded.
-                let update_result = (|| -> XCapResult<()> {
-                    let content = get_shareable_content()?;
-                    let displays = content.displays();
-                    let sc_display = displays
-                        .iter()
-                        .find(|d| d.display_id().0 == monitor_id)
-                        .ok_or_else(|| XCapError::monitor_not_found(monitor_id))?;
-                    let filter = build_exclusion_filter(sc_display, &content, excluded_window_ids);
-                    MonitorStream::apply_content_filter(stream, filter)
-                })();
-
-                match update_result {
-                    Ok(()) => {
-                        // Phase 3 — commit bookkeeping iff the entry is still
-                        // the same stream we pushed the filter to. Guard scope
-                        // ends before any await (clippy: await_holding_lock).
-                        enum Commit {
-                            Frame(RgbaImage),
-                            Wait(Arc<tokio::sync::Notify>, Arc<Mutex<Option<RgbaImage>>>),
-                            StreamChanged,
-                        }
-                        let commit = {
-                            let mut streams = MANAGER.streams.lock().map_err(|_| {
-                                XCapError::capture_failed("stream manager lock poisoned")
-                            })?;
-                            match streams.get_mut(&monitor_id) {
-                                Some(ms) if ms.generation == generation => {
-                                    ms.excluded_window_ids = sorted_input.clone();
-                                    debug!(
-                                        "updated exclusion filter in-place ({} excluded)",
-                                        sorted_input.len()
-                                    );
-                                    match ms.latest_frame() {
-                                        Some(frame) => Commit::Frame(frame),
-                                        None => Commit::Wait(
-                                            ms.frame_notify.clone(),
-                                            ms.latest_frame.clone(),
-                                        ),
-                                    }
-                                }
-                                _ => Commit::StreamChanged,
-                            }
-                        };
-                        match commit {
-                            Commit::Frame(frame) => return Ok(frame),
-                            Commit::Wait(notify, latest) => {
-                                return Self::wait_for_frame(notify, latest).await
-                            }
-                            // The stream changed under us — fall through to
-                            // the create path, which re-validates params.
-                            Commit::StreamChanged => {}
-                        }
-                    }
-                    Err(e) => {
-                        // The update FAILED — but "failed" here means "did not
-                        // complete in time", not "was not applied": a timed-out
-                        // updateContentFilter runs on an abandoned worker and
-                        // can still land on the live stream seconds later. The
-                        // stream's true filter state is now UNKNOWN, so the
-                        // entry must be poisoned: remove it (teardown outside
-                        // the lock, same rule as `invalidate`) so no future
-                        // capture can take the Plan::Done equality fast path
-                        // against a filter the OS may not be running. The next
-                        // capture recreates the stream with the correct filter
-                        // from scratch (bounded).
-                        warn!(
-                            "filter update failed for display {} ({}); invalidating stream (live filter state unknown)",
-                            monitor_id, e
-                        );
-                        let removed = remove_entry(&MANAGER.streams, &monitor_id);
-                        drop(removed);
-
-                        if !exclusions_added {
-                            // Exclusions were only REMOVED: the latched frame
-                            // was captured under the stricter previous filter,
-                            // so serving it once more never leaks. With newly
-                            // ADDED exclusions we fail closed instead and fall
-                            // through to recreation with the new filter.
-                            if let Some(frame) = fallback_frame {
-                                return Ok(frame);
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         // Slow path: create or recreate stream
@@ -658,12 +477,17 @@ impl StreamManager {
                 .map_err(|_| XCapError::capture_failed("stream manager lock poisoned"))?;
             streams
                 .get(&monitor_id)
+                .filter(|ms| {
+                    ms.width == width
+                        && ms.height == height
+                        && ms.excluded_window_ids == sorted_input
+                })
                 .map(|ms| (ms.frame_notify.clone(), ms.latest_frame.clone()))
         };
         match handles {
             Some((notify, latest)) => Self::wait_for_frame(notify, latest).await,
             None => Err(XCapError::capture_failed(
-                "stream disappeared after creation",
+                "stream disappeared or changed exclusions after creation",
             )),
         }
     }
