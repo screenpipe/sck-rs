@@ -1,3 +1,6 @@
+// screenpipe — AI that knows everything you've seen, said, or heard
+// https://screenpipe.com
+
 //! Monitor/Display capture using ScreenCaptureKit via cidre
 
 use cidre::cg;
@@ -248,6 +251,24 @@ impl Monitor {
     ) -> XCapResult<RgbaImage> {
         let (target_w, target_h) = scaled_dims(self.width, self.height, max_width);
         capture::capture_monitor_sync(self.display_id, target_w, target_h, excluded_window_ids)
+    }
+
+    /// Capture a fresh image, downscaled at the source, with window exclusions.
+    ///
+    /// Unlike the persistent latest-frame methods, this cannot return pixels
+    /// latched before the request. Use it for input/focus transitions whose
+    /// metadata describes a new surface. It does not raise the persistent
+    /// stream's frame rate. `max_width == 0` keeps the native dimensions.
+    ///
+    /// macOS 14+ uses ScreenshotManager; older versions recreate the filtered
+    /// stream. Errors are returned rather than serving an older cached frame.
+    pub fn capture_image_fresh_scaled_excluding(
+        &self,
+        max_width: u32,
+        excluded_window_ids: &[u32],
+    ) -> XCapResult<RgbaImage> {
+        let (width, height) = scaled_dims(self.width, self.height, max_width);
+        capture::capture_monitor_fresh_sync(self.display_id, width, height, excluded_window_ids)
     }
 
     /// Stop the persistent capture stream for this monitor.
