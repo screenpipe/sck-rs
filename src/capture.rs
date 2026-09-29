@@ -1037,6 +1037,32 @@ pub fn capture_monitor_sync(
     )?
 }
 
+/// Capture after the request rather than returning an older latched frame.
+/// Uses the same bounded worker and exclusion-aware one-shot path as recovery.
+/// On pre-14 macOS, restart the filtered stream to obtain a fresh first frame.
+pub fn capture_monitor_fresh_sync(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+    excluded_window_ids: &[u32],
+) -> XCapResult<RgbaImage> {
+    let ids = excluded_window_ids.to_vec();
+    run_bounded(
+        "monitor-fresh-capture",
+        Duration::from_secs(60),
+        move || {
+            if api::macos_available("14.0") {
+                block_on(capture_monitor_oneshot(monitor_id, width, height, &ids))
+            } else {
+                crate::stream_manager::invalidate_monitor_stream(monitor_id);
+                block_on(crate::stream_manager::capture_monitor_persistent(
+                    monitor_id, width, height, &ids,
+                ))
+            }
+        },
+    )?
+}
+
 /// Async version of monitor capture.
 ///
 /// Uses a persistent SCStream when possible (reuses a single stream per monitor).
@@ -1108,7 +1134,9 @@ async fn capture_monitor_oneshot(
     if api::macos_available("15.0") {
         cfg.set_show_mouse_clicks(false);
     }
-    cfg.set_scales_to_fit(false);
+    // Match the persistent stream's scaled-monitor contract. A width cap must
+    // resize the entire display, not crop its right and bottom edges.
+    cfg.set_scales_to_fit(true);
 
     debug!(
         "one-shot: capturing monitor {} at {}x{}",
