@@ -5,7 +5,7 @@
 
 use cidre::cg;
 use image::RgbaImage;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::capture;
 use crate::error::{XCapError, XCapResult};
@@ -76,41 +76,37 @@ impl Monitor {
             .map(|d| d.display_id().0)
             .unwrap_or_else(|| displays.first().map(|d| d.display_id().0).unwrap_or(0));
 
-        let monitors = displays
-            .iter()
-            .map(|d| {
-                let frame = d.frame();
-                let display_id = d.display_id().0;
+        let monitors = displays.iter().map(|d| {
+            let frame = d.frame();
+            let display_id = d.display_id().0;
 
-                // SCDisplay dimensions are points, not backing pixels. The mode's
-                // pixel/point ratio also works for rotated displays: apply it to
-                // the current global bounds, whose axes already reflect rotation.
-                let bounds = cg::DirectDisplayId(display_id).bounds();
-                let logical_width = bounds.size.width as u32;
-                let logical_height = bounds.size.height as u32;
-                let (capture_width, capture_height, scale_factor) =
-                    native_capture_size(display_id, (logical_width, logical_height))?;
-                debug!(
-                    "Display {display_id}: {logical_width}x{logical_height} points, \
+            // SCDisplay dimensions are points, not backing pixels. The mode's
+            // pixel/point ratio also works for rotated displays: apply it to
+            // the current global bounds, whose axes already reflect rotation.
+            let bounds = cg::DirectDisplayId(display_id).bounds();
+            let logical_width = bounds.size.width as u32;
+            let logical_height = bounds.size.height as u32;
+            let (capture_width, capture_height, scale_factor) =
+                native_capture_size(display_id, (logical_width, logical_height))?;
+            debug!(
+                "Display {display_id}: {logical_width}x{logical_height} points, \
                      {capture_width}x{capture_height} backing pixels, scale={scale_factor}"
-                );
+            );
 
-                Ok(Monitor {
-                    display_id,
-                    name: format!("Display {}", display_id),
-                    x: frame.origin.x as i32,
-                    y: frame.origin.y as i32,
-                    width: capture_width,
-                    height: capture_height,
-                    logical_width,
-                    logical_height,
-                    scale_factor,
-                    is_primary: display_id == primary_id,
-                })
+            Ok(Monitor {
+                display_id,
+                name: format!("Display {}", display_id),
+                x: frame.origin.x as i32,
+                y: frame.origin.y as i32,
+                width: capture_width,
+                height: capture_height,
+                logical_width,
+                logical_height,
+                scale_factor,
+                is_primary: display_id == primary_id,
             })
-            .collect::<XCapResult<Vec<_>>>()?;
-
-        Ok(monitors)
+        });
+        collect_available_monitors(monitors)
     }
 
     /// Get the primary monitor
@@ -275,6 +271,27 @@ fn scaled_dims(src_w: u32, src_h: u32, max_width: u32) -> (u32, u32) {
 }
 
 // These CoreGraphics mode APIs predate ScreenCaptureKit's macOS 12.3 minimum.
+// A display can disappear after the SCK snapshot but before its mode query.
+// Preserve the other captures instead of failing discovery for every display.
+fn collect_available_monitors(
+    monitors: impl Iterator<Item = XCapResult<Monitor>>,
+) -> XCapResult<Vec<Monitor>> {
+    let available: Vec<_> = monitors
+        .filter_map(|monitor| match monitor {
+            Ok(monitor) => Some(monitor),
+            Err(error) => {
+                warn!("Skipping unavailable display: {error}");
+                None
+            }
+        })
+        .collect();
+    if available.is_empty() {
+        Err(XCapError::no_monitors())
+    } else {
+        Ok(available)
+    }
+}
+
 // CGDisplayPixelsWide can return point-sized dimensions on HiDPI virtual
 // displays, so read the display mode's explicit backing-pixel dimensions.
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -366,9 +383,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_monitor_getters() {
-        let monitor = Monitor {
+    fn sample_monitor() -> Monitor {
+        Monitor {
             display_id: 1,
             name: "Test Display".to_string(),
             x: 0,
@@ -379,8 +395,27 @@ mod tests {
             logical_height: 1080,
             scale_factor: 2.0,
             is_primary: true,
-        };
+        }
+    }
 
+    #[test]
+    fn unavailable_display_does_not_remove_healthy_captures() {
+        let monitors = collect_available_monitors(
+            [
+                Err(XCapError::new("display disappeared during enumeration")),
+                Ok(sample_monitor()),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[0].id(), 1);
+        assert!(collect_available_monitors([Err(XCapError::no_monitors())].into_iter()).is_err());
+    }
+
+    #[test]
+    fn test_monitor_getters() {
+        let monitor = sample_monitor();
         assert_eq!(monitor.id(), 1);
         assert_eq!(monitor.name(), "Test Display");
         assert_eq!(monitor.x(), 0);
