@@ -149,3 +149,16 @@ cargo run --example capture_window -- Safari
 ## License
 
 MIT
+
+### Standalone macOS host lifecycle
+
+A long-lived capture host must initialize AppKit on its process main thread and
+service that thread's run loop. GUI applications already provide this lifecycle.
+A Tokio runtime alone does not deliver display-environment updates: after hotplug,
+CoreGraphics mode queries can remain unavailable even while ScreenCaptureKit lists
+the display. Keep initialization and the main loop in the host, not in a capture
+callback. Monitor discovery skips unavailable display modes while preserving other
+healthy displays; it never assumes a 1x backing scale for an unknown mode.
+
+Monitor capture dimensions are backing pixels. Use `logical_width()` and
+`logical_height()` with `x()`/`y()` for desktop geometry and cursor attribution.
