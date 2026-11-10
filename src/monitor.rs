@@ -5,7 +5,7 @@
 
 use cidre::cg;
 use image::RgbaImage;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::capture;
 use crate::error::{XCapError, XCapResult};
@@ -23,9 +23,9 @@ pub struct Monitor {
     x: i32,
     /// Display Y position
     y: i32,
-    /// Display width in pixels used for capture (SCK dimensions)
+    /// Display width in backing pixels used for capture
     width: u32,
-    /// Display height in pixels used for capture (SCK dimensions)
+    /// Display height in backing pixels used for capture
     height: u32,
     /// Logical width (what macOS reports for UI layout)
     logical_width: u32,
@@ -76,61 +76,37 @@ impl Monitor {
             .map(|d| d.display_id().0)
             .unwrap_or_else(|| displays.first().map(|d| d.display_id().0).unwrap_or(0));
 
-        let monitors: Vec<Monitor> = displays
-            .iter()
-            .map(|d| {
-                let frame = d.frame();
-                let display_id = d.display_id().0;
+        let monitors = displays.iter().map(|d| {
+            let frame = d.frame();
+            let display_id = d.display_id().0;
 
-                // SCK dimensions (what SCK expects for capture)
-                let sck_width = d.width() as u32;
-                let sck_height = d.height() as u32;
+            // SCDisplay dimensions are points, not backing pixels. The mode's
+            // pixel/point ratio also works for rotated displays: apply it to
+            // the current global bounds, whose axes already reflect rotation.
+            let bounds = cg::DirectDisplayId(display_id).bounds();
+            let logical_width = bounds.size.width as u32;
+            let logical_height = bounds.size.height as u32;
+            let (capture_width, capture_height, scale_factor) =
+                native_capture_size(display_id, (logical_width, logical_height))?;
+            debug!(
+                "Display {display_id}: {logical_width}x{logical_height} points, \
+                     {capture_width}x{capture_height} backing pixels, scale={scale_factor}"
+            );
 
-                // Use cidre's CGDirectDisplayId for native pixel info
-                let cg_id = cg::DirectDisplayId(display_id);
-                let cg_pixels_width = cg_id.pixels_wide() as u32;
-                let cg_pixels_height = cg_id.pixels_high() as u32;
-                let cg_bounds = cg_id.bounds();
-                let cg_bounds_width = cg_bounds.size.width as u32;
-                let cg_bounds_height = cg_bounds.size.height as u32;
-
-                // Use SCK dimensions for capture
-                let (capture_width, capture_height) = (sck_width, sck_height);
-
-                // Calculate scale factor
-                let scale_factor = if sck_width > 0 && sck_height > 0 {
-                    let width_scale = cg_pixels_width as f64 / sck_width as f64;
-                    let height_scale = cg_pixels_height as f64 / sck_height as f64;
-                    ((width_scale + height_scale) / 2.0).max(1.0)
-                } else {
-                    1.0
-                };
-
-                debug!(
-                    "Display {} dimensions - SCK: {}x{}, CGPixels: {}x{}, CGBounds: {}x{}, using: {}x{}",
-                    display_id,
-                    sck_width, sck_height,
-                    cg_pixels_width, cg_pixels_height,
-                    cg_bounds_width, cg_bounds_height,
-                    capture_width, capture_height
-                );
-
-                Monitor {
-                    display_id,
-                    name: format!("Display {}", display_id),
-                    x: frame.origin.x as i32,
-                    y: frame.origin.y as i32,
-                    width: capture_width,
-                    height: capture_height,
-                    logical_width: cg_bounds_width,
-                    logical_height: cg_bounds_height,
-                    scale_factor,
-                    is_primary: display_id == primary_id,
-                }
+            Ok(Monitor {
+                display_id,
+                name: format!("Display {}", display_id),
+                x: frame.origin.x as i32,
+                y: frame.origin.y as i32,
+                width: capture_width,
+                height: capture_height,
+                logical_width,
+                logical_height,
+                scale_factor,
+                is_primary: display_id == primary_id,
             })
-            .collect();
-
-        Ok(monitors)
+        });
+        collect_available_monitors(monitors)
     }
 
     /// Get the primary monitor
@@ -294,13 +270,121 @@ fn scaled_dims(src_w: u32, src_h: u32, max_width: u32) -> (u32, u32) {
     (target_w, (target_h as u32).max(1))
 }
 
+// These CoreGraphics mode APIs predate ScreenCaptureKit's macOS 12.3 minimum.
+// A display can disappear after the SCK snapshot but before its mode query.
+// Preserve the other captures instead of failing discovery for every display.
+fn collect_available_monitors(
+    monitors: impl Iterator<Item = XCapResult<Monitor>>,
+) -> XCapResult<Vec<Monitor>> {
+    let available: Vec<_> = monitors
+        .filter_map(|monitor| match monitor {
+            Ok(monitor) => Some(monitor),
+            Err(error) => {
+                warn!("Skipping unavailable display: {error}");
+                None
+            }
+        })
+        .collect();
+    if available.is_empty() {
+        Err(XCapError::no_monitors())
+    } else {
+        Ok(available)
+    }
+}
+
+// CGDisplayPixelsWide can return point-sized dimensions on HiDPI virtual
+// displays, so read the display mode's explicit backing-pixel dimensions.
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGDisplayCopyDisplayMode(display: u32) -> *const std::ffi::c_void;
+    fn CGDisplayModeGetWidth(mode: *const std::ffi::c_void) -> usize;
+    fn CGDisplayModeGetHeight(mode: *const std::ffi::c_void) -> usize;
+    fn CGDisplayModeGetPixelWidth(mode: *const std::ffi::c_void) -> usize;
+    fn CGDisplayModeGetPixelHeight(mode: *const std::ffi::c_void) -> usize;
+    fn CGDisplayModeRelease(mode: *const std::ffi::c_void);
+}
+
+fn native_capture_size(display: u32, logical: (u32, u32)) -> XCapResult<(u32, u32, f64)> {
+    // SAFETY: Copy returns an owned mode or null. All getters use that live
+    // object, and it is released exactly once before validation can fail.
+    let mode = unsafe {
+        let mode = CGDisplayCopyDisplayMode(display);
+        if mode.is_null() {
+            return Err(XCapError::new(format!(
+                "Display {display} has no current mode"
+            )));
+        }
+        let dimensions = (
+            CGDisplayModeGetWidth(mode),
+            CGDisplayModeGetHeight(mode),
+            CGDisplayModeGetPixelWidth(mode),
+            CGDisplayModeGetPixelHeight(mode),
+        );
+        CGDisplayModeRelease(mode);
+        dimensions
+    };
+    capture_size(logical, mode)
+}
+
+fn capture_size(
+    logical: (u32, u32),
+    mode: (usize, usize, usize, usize),
+) -> XCapResult<(u32, u32, f64)> {
+    let (mw, mh, pw, ph) = mode;
+    if logical.0 == 0 || logical.1 == 0 || mw == 0 || mh == 0 || pw == 0 || ph == 0 {
+        return Err(XCapError::new(
+            "Display has empty logical or backing dimensions",
+        ));
+    }
+    let scale = pw as f64 / mw as f64;
+    let vertical_scale = ph as f64 / mh as f64;
+    if (scale - vertical_scale).abs() > 0.001 {
+        return Err(XCapError::new(
+            "Display mode has inconsistent backing scales",
+        ));
+    }
+    let width = (logical.0 as f64 * scale).round();
+    let height = (logical.1 as f64 * scale).round();
+    if width < 1.0 || height < 1.0 || width > u32::MAX as f64 || height > u32::MAX as f64 {
+        return Err(XCapError::new(
+            "Display backing dimensions are out of range",
+        ));
+    }
+    Ok((width as u32, height as u32, scale))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_monitor_getters() {
-        let monitor = Monitor {
+    fn backing_size_preserves_points_and_rotation() {
+        for (logical, mode, expected) in [
+            ((1280, 720), (1280, 720, 1280, 720), (1280, 720, 1.0)),
+            ((1280, 720), (1280, 720, 2560, 1440), (2560, 1440, 2.0)),
+            ((720, 1280), (1280, 720, 2560, 1440), (1440, 2560, 2.0)),
+            ((1920, 1080), (1920, 1080, 2880, 1620), (2880, 1620, 1.5)),
+            ((3008, 1692), (3008, 1692, 6016, 3384), (6016, 3384, 2.0)),
+        ] {
+            assert_eq!(capture_size(logical, mode).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_backing_size_is_not_silently_truncated() {
+        for (logical, mode) in [
+            ((0, 720), (1280, 720, 2560, 1440)),
+            ((1280, 720), (0, 720, 2560, 1440)),
+            ((1280, 720), (1280, 720, 0, 1440)),
+            ((1280, 720), (1280, 720, 2560, 720)),
+            ((u32::MAX, 720), (1280, 720, 2560, 1440)),
+        ] {
+            assert!(capture_size(logical, mode).is_err());
+        }
+    }
+
+    fn sample_monitor() -> Monitor {
+        Monitor {
             display_id: 1,
             name: "Test Display".to_string(),
             x: 0,
@@ -311,8 +395,27 @@ mod tests {
             logical_height: 1080,
             scale_factor: 2.0,
             is_primary: true,
-        };
+        }
+    }
 
+    #[test]
+    fn unavailable_display_does_not_remove_healthy_captures() {
+        let monitors = collect_available_monitors(
+            [
+                Err(XCapError::new("display disappeared during enumeration")),
+                Ok(sample_monitor()),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[0].id(), 1);
+        assert!(collect_available_monitors([Err(XCapError::no_monitors())].into_iter()).is_err());
+    }
+
+    #[test]
+    fn test_monitor_getters() {
+        let monitor = sample_monitor();
         assert_eq!(monitor.id(), 1);
         assert_eq!(monitor.name(), "Test Display");
         assert_eq!(monitor.x(), 0);
