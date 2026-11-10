@@ -839,9 +839,16 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
     result
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FRAME_CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Safely call image_buf_to_rgba with catch_unwind to prevent panics from
 /// corrupt pixel buffers from crashing the entire application.
 pub(crate) fn safe_image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult<RgbaImage> {
+    #[cfg(test)]
+    FRAME_CONVERSIONS.with(|count| count.set(count.get() + 1));
     match panic::catch_unwind(panic::AssertUnwindSafe(|| image_buf_to_rgba(image_buf))) {
         Ok(result) => result,
         Err(_) => Err(XCapError::capture_failed(
