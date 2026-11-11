@@ -1,3 +1,6 @@
+// screenpipe — AI that knows everything you've seen, said, or heard
+// https://screenpipe.com
+
 //! Persistent SCStream manager — reuses a single stream per monitor.
 //!
 //! Instead of creating/destroying ScreenCaptureKit objects on every capture,
@@ -21,16 +24,76 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{ffi::c_void, ptr::NonNull};
 use tracing::{debug, info, warn};
 
-use crate::capture::{await_sck_callback, get_shareable_content, safe_image_buf_to_rgba};
+use crate::capture::{
+    await_sck_callback, get_shareable_content, safe_image_buf_to_rgba, safe_raw_image_buf_to_rgba,
+};
 use crate::error::{XCapError, XCapResult};
 
 // ── Frame receiver (ObjC callback) ─────────────────────────────────
 
+struct NativeFrame {
+    image: NonNull<c_void>,
+    conversion_lock: Arc<Mutex<()>>,
+}
+
+impl NativeFrame {
+    fn from_owned_image(image: arc::R<cv::ImageBuf>, conversion_lock: Arc<Mutex<()>>) -> Self {
+        // cidre::Retained is repr(transparent) over a non-null reference.
+        // Move its owned +1 reference directly into the raw handle, preserving
+        // provenance without creating a shared reborrow or running its Drop.
+        // No Rust reference is reconstructed by Clone, Drop or conversion.
+        let pointer =
+            unsafe { std::mem::transmute::<arc::R<cv::ImageBuf>, NonNull<c_void>>(image) };
+        Self {
+            image: pointer,
+            conversion_lock,
+        }
+    }
+}
+
+impl Clone for NativeFrame {
+    fn clone(&self) -> Self {
+        // CoreFoundation retain/release are atomic. Each handle owns one retain.
+        unsafe {
+            CFRetain(self.image.as_ptr());
+        }
+        Self {
+            image: self.image,
+            conversion_lock: self.conversion_lock.clone(),
+        }
+    }
+}
+
+impl Drop for NativeFrame {
+    fn drop(&mut self) {
+        unsafe {
+            CFRelease(self.image.as_ptr());
+        }
+    }
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRetain(value: *const c_void) -> *const c_void;
+    fn CFRelease(value: *const c_void);
+    #[cfg(test)]
+    fn CFGetRetainCount(value: *const c_void) -> isize;
+}
+
+// SAFETY: Only completed, immutable SCK pixel buffers enter this latch. Each
+// raw handle owns a +1 native retain until Drop. No Rust reference to the
+// native object crosses threads or is constructed by Clone/Drop/conversion.
+// CPU pixel access is serialized by conversion_lock and CoreVideo's read lock;
+// the callback never takes that lock. No mutation or raw pointer is public.
+unsafe impl Send for NativeFrame {}
+
 #[repr(C)]
 struct FrameReceiverInner {
-    latest_frame: Arc<Mutex<Option<RgbaImage>>>,
+    latest_frame: Arc<Mutex<Option<NativeFrame>>>,
+    conversion_lock: Arc<Mutex<()>>,
     frame_notify: Arc<tokio::sync::Notify>,
     /// When set, the receiver runs in *push* mode: every delivered frame is
     /// forwarded to this channel (newest dropped on backpressure) instead of
@@ -104,34 +167,68 @@ impl OutputImpl for FrameReceiver {
         }
 
         // Extract image buffer from sample
-        let Some(mut image_buf) = sample_buf.image_buf().map(|b| b.retained()) else {
+        let Some(image_buf) = sample_buf.image_buf().map(|b| b.retained()) else {
             return;
         };
 
-        // Convert BGRA → RGBA
-        let image = match safe_image_buf_to_rgba(&mut image_buf) {
-            Ok(img) => img,
-            Err(e) => {
-                debug!("stream frame conversion failed: {}", e);
-                return;
-            }
-        };
-
-        let inner = self.inner_mut();
-        // Push mode (HD): forward every frame to the channel and return. Drop
-        // the newest frame on backpressure (`try_send`) so a slow encoder never
-        // stalls this OS callback queue — a dropped frame is just a tiny replay
-        // gap, never a capture hang.
-        if let Some(tx) = inner.frame_tx.as_ref() {
-            let _ = tx.try_send(image);
-            return;
-        }
-        // Latch mode (default): keep only the latest frame + wake waiters.
-        if let Ok(mut guard) = inner.latest_frame.lock() {
-            *guard = Some(image);
-        }
-        inner.frame_notify.notify_waiters();
+        self.inner_mut().receive_image_buf(image_buf);
     }
+}
+
+impl FrameReceiverInner {
+    fn receive_image_buf(&mut self, mut image_buf: arc::R<cv::ImageBuf>) {
+        // HD push consumers need every admitted frame. The callback already
+        // checked channel capacity before retaining the pixel buffer.
+        if let Some(tx) = self.frame_tx.as_ref() {
+            match safe_image_buf_to_rgba(&mut image_buf) {
+                Ok(image) => {
+                    let _ = tx.try_send(image);
+                }
+                Err(error) => debug!("stream frame conversion failed: {}", error),
+            }
+            return;
+        }
+
+        // Keep the last valid surface when SCK supplies unsupported metadata,
+        // just as the eager converter did before replacing its RGBA latch.
+        let width = image_buf.width();
+        let height = image_buf.height();
+        if width == 0
+            || height == 0
+            || width > 16384
+            || height > 16384
+            || image_buf.pixel_format() != cv::PixelFormat::_32_BGRA
+        {
+            return;
+        }
+
+        // Screenshot consumers are pull-based. Retain only the latest native
+        // surface instead of allocating/copying a Retina-sized RGBA image on
+        // every OS callback, including frames nobody will ever request.
+        // Replacing the retained buffer releases the previous surface; a reader
+        // retains its own handle before dropping the mutex and converting.
+        let previous = if let Ok(mut guard) = self.latest_frame.lock() {
+            guard.replace(NativeFrame::from_owned_image(
+                image_buf,
+                self.conversion_lock.clone(),
+            ))
+        } else {
+            return;
+        };
+        drop(previous);
+        self.frame_notify.notify_waiters();
+    }
+}
+
+fn convert_latched_frame(frame: NativeFrame) -> XCapResult<RgbaImage> {
+    // Created once per stream, not per callback. Serialize only consumers: the
+    // SCK callback can replace its latch while another thread reads an old frame.
+    let _conversion = frame
+        .conversion_lock
+        .lock()
+        .map_err(|_| XCapError::capture_failed("frame conversion lock poisoned"))?;
+    // The owned retain keeps the buffer alive throughout the raw FFI call.
+    unsafe { safe_raw_image_buf_to_rgba(frame.image) }
 }
 
 // A ScreenCaptureKit stop completion is normally prompt, but macOS can fail to
@@ -196,7 +293,7 @@ struct MonitorStream {
     _stream: arc::R<sc::Stream>,
     _output: arc::R<FrameReceiver>,
     _queue: arc::R<dispatch::Queue>,
-    latest_frame: Arc<Mutex<Option<RgbaImage>>>,
+    latest_frame: Arc<Mutex<Option<NativeFrame>>>,
     frame_notify: Arc<tokio::sync::Notify>,
     /// Shared with the FrameReceiver callback; see `FrameReceiverInner::frame_seq`.
     frame_seq: Arc<AtomicU64>,
@@ -222,6 +319,7 @@ impl MonitorStream {
 
         let inner = FrameReceiverInner {
             latest_frame: latest_frame.clone(),
+            conversion_lock: Arc::new(Mutex::new(())),
             frame_notify: frame_notify.clone(),
             frame_seq: frame_seq.clone(),
             frame_tx,
@@ -297,7 +395,7 @@ impl MonitorStream {
         })
     }
 
-    fn latest_frame(&self) -> Option<RgbaImage> {
+    fn latest_frame(&self) -> Option<NativeFrame> {
         self.latest_frame.lock().ok()?.clone()
     }
 
@@ -428,9 +526,9 @@ impl StreamManager {
             /// No usable stream — create or recreate below.
             Create,
             /// Stream matches but has no frame latched yet.
-            Wait(Arc<tokio::sync::Notify>, Arc<Mutex<Option<RgbaImage>>>),
+            Wait(Arc<tokio::sync::Notify>, Arc<Mutex<Option<NativeFrame>>>),
             /// Stream matches and a frame is latched.
-            Done(RgbaImage),
+            Done(NativeFrame),
         }
 
         let plan = {
@@ -460,7 +558,7 @@ impl StreamManager {
         };
 
         match plan {
-            Plan::Done(frame) => return Ok(frame),
+            Plan::Done(frame) => return convert_latched_frame(frame),
             Plan::Wait(notify, latest) => return Self::wait_for_frame(notify, latest).await,
             Plan::Create => {}
         }
@@ -494,11 +592,12 @@ impl StreamManager {
 
     async fn wait_for_frame(
         notify: Arc<tokio::sync::Notify>,
-        latest: Arc<Mutex<Option<RgbaImage>>>,
+        latest: Arc<Mutex<Option<NativeFrame>>>,
     ) -> XCapResult<RgbaImage> {
         // Check if frame is already available
-        if let Some(frame) = latest.lock().ok().and_then(|g| g.clone()) {
-            return Ok(frame);
+        let frame = latest.lock().ok().and_then(|guard| guard.clone());
+        if let Some(frame) = frame {
+            return convert_latched_frame(frame);
         }
 
         tokio::select! {
@@ -517,11 +616,12 @@ impl StreamManager {
             }
         }
 
-        latest
+        let frame = latest
             .lock()
             .ok()
-            .and_then(|g| g.clone())
-            .ok_or_else(|| XCapError::capture_failed("no frame after wait"))
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| XCapError::capture_failed("no frame after wait"))?;
+        convert_latched_frame(frame)
     }
 
     fn create_stream(
@@ -678,12 +778,13 @@ pub fn monitor_frame_seq(monitor_id: u32) -> Option<u64> {
 /// stream, without waiting or creating a stream. `None` when no stream exists
 /// yet or no frame has been delivered.
 pub fn peek_latest_frame(monitor_id: u32) -> Option<RgbaImage> {
-    MANAGER
+    let frame = MANAGER
         .streams
         .try_lock()
         .ok()?
         .get(&monitor_id)
-        .and_then(|ms| ms.latest_frame())
+        .and_then(|ms| ms.latest_frame())?;
+    convert_latched_frame(frame).ok()
 }
 
 // ── High-FPS HD capture (push mode) ────────────────────────────────
@@ -799,6 +900,269 @@ mod stream_manager_regression_tests {
             push_channel_accepts_frame(&tx),
             "conversion can resume as soon as the recorder drains the handoff"
         );
+    }
+
+    #[test]
+    fn latch_callbacks_do_not_convert_unrequested_frames() {
+        let pixels = cv::PixelBuf::new(64, 32, cv::PixelFormat::_32_BGRA, None).unwrap();
+        let mut receiver = FrameReceiverInner {
+            latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
+            frame_notify: Arc::new(tokio::sync::Notify::new()),
+            frame_tx: None,
+            frame_seq: Arc::new(AtomicU64::new(0)),
+        };
+        crate::capture::FRAME_CONVERSIONS.with(|count| count.set(0));
+        for _ in 0..100 {
+            receiver.receive_image_buf(pixels.retained());
+        }
+        assert!(receiver.latest_frame.lock().unwrap().is_some());
+        crate::capture::FRAME_CONVERSIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "unused stream callbacks must not allocate RGBA screenshots"
+            );
+        });
+    }
+
+    #[test]
+    fn latched_native_frame_survives_replacement_and_converts_on_demand() {
+        let first = cv::PixelBuf::new(64, 32, cv::PixelFormat::_32_BGRA, None).unwrap();
+        let second = cv::PixelBuf::new(32, 16, cv::PixelFormat::_32_BGRA, None).unwrap();
+        let mut receiver = FrameReceiverInner {
+            latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
+            frame_notify: Arc::new(tokio::sync::Notify::new()),
+            frame_tx: None,
+            frame_seq: Arc::new(AtomicU64::new(0)),
+        };
+        receiver.receive_image_buf(first);
+        let retained = receiver.latest_frame.lock().unwrap().clone().unwrap();
+        receiver.receive_image_buf(second);
+        crate::capture::FRAME_CONVERSIONS.with(|count| count.set(0));
+        assert_eq!(
+            convert_latched_frame(retained).unwrap().dimensions(),
+            (64, 32)
+        );
+        let latest = receiver.latest_frame.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            convert_latched_frame(latest).unwrap().dimensions(),
+            (32, 16)
+        );
+        crate::capture::FRAME_CONVERSIONS.with(|count| assert_eq!(count.get(), 2));
+    }
+
+    #[test]
+    fn push_mode_still_converts_and_delivers_frames() {
+        let pixels = cv::PixelBuf::new(64, 32, cv::PixelFormat::_32_BGRA, None).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut receiver = FrameReceiverInner {
+            latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
+            frame_notify: Arc::new(tokio::sync::Notify::new()),
+            frame_tx: Some(tx),
+            frame_seq: Arc::new(AtomicU64::new(0)),
+        };
+        receiver.receive_image_buf(pixels);
+        assert_eq!(rx.try_recv().unwrap().dimensions(), (64, 32));
+        assert!(receiver.latest_frame.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn unsupported_native_frame_does_not_replace_the_valid_latch() {
+        let first = cv::PixelBuf::new(64, 32, cv::PixelFormat::_32_BGRA, None).unwrap();
+        let unsupported = cv::PixelBuf::new(32, 16, cv::PixelFormat::_32_ARGB, None).unwrap();
+        let mut receiver = FrameReceiverInner {
+            latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
+            frame_notify: Arc::new(tokio::sync::Notify::new()),
+            frame_tx: None,
+            frame_seq: Arc::new(AtomicU64::new(0)),
+        };
+        receiver.receive_image_buf(first);
+        receiver.receive_image_buf(unsupported);
+        let retained = receiver.latest_frame.lock().unwrap().clone().unwrap();
+        drop(receiver);
+        let frame = std::thread::spawn(move || convert_latched_frame(retained).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(frame.dimensions(), (64, 32));
+    }
+
+    fn colored_pixel_buffer() -> arc::R<cv::ImageBuf> {
+        let mut pixels = cv::PixelBuf::new(64, 32, cv::PixelFormat::_32_BGRA, None).unwrap();
+        let flags = cv::pixel_buffer::LockFlags::default();
+        unsafe {
+            assert!(pixels.lock_base_addr(flags).is_ok());
+            let stride = pixels.bytes_per_row();
+            let base = pixels.base_address_mut().cast::<u8>();
+            for y in 0..32 {
+                for x in 0..64 {
+                    std::ptr::copy_nonoverlapping(
+                        [0x31u8, 0x72, 0xa4, 0xff].as_ptr(),
+                        base.add(y * stride + x * 4),
+                        4,
+                    );
+                }
+            }
+            assert!(pixels.unlock_lock_base_addr(flags).is_ok());
+        }
+        pixels
+    }
+
+    #[test]
+    fn concurrent_readers_preserve_native_pixels() {
+        let frame = NativeFrame::from_owned_image(colored_pixel_buffer(), Arc::new(Mutex::new(())));
+        let start = Arc::new(Barrier::new(9));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let frame = frame.clone();
+            let start = start.clone();
+            readers.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..128 {
+                    let converted = convert_latched_frame(frame.clone()).unwrap();
+                    assert_eq!(converted.dimensions(), (64, 32));
+                    assert!(converted
+                        .pixels()
+                        .all(|pixel| pixel.0 == [0xa4, 0x72, 0x31, 0xff]));
+                }
+            }));
+        }
+        drop(frame);
+        start.wait();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn native_frame_clones_balance_retains_across_threads() {
+        let frame = NativeFrame::from_owned_image(colored_pixel_buffer(), Arc::new(Mutex::new(())));
+        let anchor = frame.clone();
+        let baseline = unsafe { CFGetRetainCount(anchor.image.as_ptr()) };
+        let ready = Arc::new(Barrier::new(9));
+        let release = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let frame = frame.clone();
+            let ready = ready.clone();
+            let release = release.clone();
+            workers.push(thread::spawn(move || {
+                for _ in 0..128 {
+                    drop(frame.clone());
+                }
+                ready.wait();
+                release.wait();
+                drop(frame);
+            }));
+        }
+        ready.wait();
+        assert_eq!(
+            unsafe { CFGetRetainCount(anchor.image.as_ptr()) },
+            baseline + 8
+        );
+        drop(frame);
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            unsafe { CFGetRetainCount(anchor.image.as_ptr()) },
+            baseline - 1
+        );
+        assert_eq!(
+            convert_latched_frame(anchor).unwrap().dimensions(),
+            (64, 32)
+        );
+    }
+
+    #[test]
+    fn busy_reader_does_not_block_callback_replacement() {
+        let mut receiver = FrameReceiverInner {
+            latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
+            frame_notify: Arc::new(tokio::sync::Notify::new()),
+            frame_tx: None,
+            frame_seq: Arc::new(AtomicU64::new(0)),
+        };
+        receiver.receive_image_buf(colored_pixel_buffer());
+        let frame = receiver.latest_frame.lock().unwrap().clone().unwrap();
+        let conversion_lock = frame.conversion_lock.clone();
+        let held = conversion_lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(convert_latched_frame(frame).unwrap())
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let (replaced_tx, replaced_rx) = mpsc::channel();
+        let callback = thread::spawn(move || {
+            receiver.receive_image_buf(colored_pixel_buffer());
+            replaced_tx.send(()).unwrap();
+        });
+        replaced_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback must not wait for a busy pixel-buffer reader");
+        drop(held);
+        let image = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(image
+            .pixels()
+            .all(|pixel| pixel.0 == [0xa4, 0x72, 0x31, 0xff]));
+        reader.join().unwrap();
+        callback.join().unwrap();
+    }
+
+    // Native memory probe: run explicitly so normal tests stay small.
+    #[test]
+    #[ignore]
+    fn screenshot_latch_memory_probe() {
+        fn footprint() -> u64 {
+            unsafe extern "C" {
+                fn proc_pid_rusage(pid: i32, flavor: i32, data: *mut u8) -> i32;
+            }
+            let mut data = [0u64; 512];
+            assert_eq!(
+                unsafe { proc_pid_rusage(std::process::id() as i32, 2, data.as_mut_ptr().cast()) },
+                0
+            );
+            data[9]
+        }
+        let mut pixels = cv::PixelBuf::new(3024, 1964, cv::PixelFormat::_32_BGRA, None).unwrap();
+        let flags = cv::pixel_buffer::LockFlags::default();
+        unsafe {
+            assert!(pixels.lock_base_addr(flags).is_ok());
+            let len = pixels.bytes_per_row() * pixels.height();
+            std::ptr::write_bytes(pixels.base_address_mut(), 255, len);
+            assert!(pixels.unlock_lock_base_addr(flags).is_ok());
+        }
+        let before = footprint();
+        let mut receiver = FrameReceiverInner {
+            latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
+            frame_notify: Arc::new(tokio::sync::Notify::new()),
+            frame_tx: None,
+            frame_seq: Arc::new(AtomicU64::new(0)),
+        };
+        crate::capture::FRAME_CONVERSIONS.with(|count| count.set(0));
+        let started = std::time::Instant::now();
+        let mut peak = before;
+        for _ in 0..32 {
+            receiver.receive_image_buf(pixels.retained());
+            peak = peak.max(footprint());
+        }
+        drop(receiver);
+        let after = footprint();
+        println!("{{\"callbacks\":32,\"before_bytes\":{before},\"peak_bytes\":{peak},\"after_drop_bytes\":{after},\"elapsed_ms\":{}}}", started.elapsed().as_millis());
+        crate::capture::FRAME_CONVERSIONS.with(|count| println!("conversions={}", count.get()));
     }
 
     #[test]
