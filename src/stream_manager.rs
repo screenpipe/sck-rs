@@ -32,18 +32,24 @@ use crate::error::{XCapError, XCapResult};
 // ── Frame receiver (ObjC callback) ─────────────────────────────────
 
 #[derive(Clone)]
-struct NativeFrame(arc::R<cv::ImageBuf>);
+struct NativeFrame {
+    image: arc::R<cv::ImageBuf>,
+    conversion_lock: Arc<Mutex<()>>,
+}
 
 // SAFETY: ScreenCaptureKit delivers completed, immutable pixel buffers. The
 // retained CoreVideo handle keeps its surface alive across callback return and
 // prevents reuse while a reader owns it. NativeFrame exposes no mutation API:
 // conversion only reads pixels under CVPixelBuffer's READ_ONLY base-address lock.
-// Each retained handle is owned by one thread; shared latch access uses a mutex.
+// Each retained handle is owned by one thread. A stream-scoped mutex serializes
+// native CPU lock/copy operations across cloned handles; the callback never waits
+// on that mutex, and latch access has its own short-held mutex.
 unsafe impl Send for NativeFrame {}
 
 #[repr(C)]
 struct FrameReceiverInner {
     latest_frame: Arc<Mutex<Option<NativeFrame>>>,
+    conversion_lock: Arc<Mutex<()>>,
     frame_notify: Arc<tokio::sync::Notify>,
     /// When set, the receiver runs in *push* mode: every delivered frame is
     /// forwarded to this channel (newest dropped on backpressure) instead of
@@ -158,7 +164,10 @@ impl FrameReceiverInner {
         // Replacing the retained buffer releases the previous surface; a reader
         // retains its own handle before dropping the mutex and converting.
         let previous = if let Ok(mut guard) = self.latest_frame.lock() {
-            guard.replace(NativeFrame(image_buf))
+            guard.replace(NativeFrame {
+                image: image_buf,
+                conversion_lock: self.conversion_lock.clone(),
+            })
         } else {
             return;
         };
@@ -168,7 +177,13 @@ impl FrameReceiverInner {
 }
 
 fn convert_latched_frame(mut frame: NativeFrame) -> XCapResult<RgbaImage> {
-    safe_image_buf_to_rgba(&mut frame.0)
+    // Created once per stream, not per callback. Serialize only consumers: the
+    // SCK callback can replace its latch while another thread reads an old frame.
+    let _conversion = frame
+        .conversion_lock
+        .lock()
+        .map_err(|_| XCapError::capture_failed("frame conversion lock poisoned"))?;
+    safe_image_buf_to_rgba(&mut frame.image)
 }
 
 // A ScreenCaptureKit stop completion is normally prompt, but macOS can fail to
@@ -259,6 +274,7 @@ impl MonitorStream {
 
         let inner = FrameReceiverInner {
             latest_frame: latest_frame.clone(),
+            conversion_lock: Arc::new(Mutex::new(())),
             frame_notify: frame_notify.clone(),
             frame_seq: frame_seq.clone(),
             frame_tx,
@@ -846,6 +862,7 @@ mod stream_manager_regression_tests {
         let pixels = cv::PixelBuf::new(64, 32, cv::PixelFormat::_32_BGRA, None).unwrap();
         let mut receiver = FrameReceiverInner {
             latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
             frame_notify: Arc::new(tokio::sync::Notify::new()),
             frame_tx: None,
             frame_seq: Arc::new(AtomicU64::new(0)),
@@ -870,6 +887,7 @@ mod stream_manager_regression_tests {
         let second = cv::PixelBuf::new(32, 16, cv::PixelFormat::_32_BGRA, None).unwrap();
         let mut receiver = FrameReceiverInner {
             latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
             frame_notify: Arc::new(tokio::sync::Notify::new()),
             frame_tx: None,
             frame_seq: Arc::new(AtomicU64::new(0)),
@@ -896,6 +914,7 @@ mod stream_manager_regression_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut receiver = FrameReceiverInner {
             latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
             frame_notify: Arc::new(tokio::sync::Notify::new()),
             frame_tx: Some(tx),
             frame_seq: Arc::new(AtomicU64::new(0)),
@@ -911,6 +930,7 @@ mod stream_manager_regression_tests {
         let unsupported = cv::PixelBuf::new(32, 16, cv::PixelFormat::_32_ARGB, None).unwrap();
         let mut receiver = FrameReceiverInner {
             latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
             frame_notify: Arc::new(tokio::sync::Notify::new()),
             frame_tx: None,
             frame_seq: Arc::new(AtomicU64::new(0)),
@@ -923,6 +943,99 @@ mod stream_manager_regression_tests {
             .join()
             .unwrap();
         assert_eq!(frame.dimensions(), (64, 32));
+    }
+
+    fn colored_pixel_buffer() -> arc::R<cv::ImageBuf> {
+        let mut pixels = cv::PixelBuf::new(64, 32, cv::PixelFormat::_32_BGRA, None).unwrap();
+        let flags = cv::pixel_buffer::LockFlags::default();
+        unsafe {
+            assert!(pixels.lock_base_addr(flags).is_ok());
+            let stride = pixels.bytes_per_row();
+            let base = pixels.base_address_mut().cast::<u8>();
+            for y in 0..32 {
+                for x in 0..64 {
+                    std::ptr::copy_nonoverlapping(
+                        [0x31u8, 0x72, 0xa4, 0xff].as_ptr(),
+                        base.add(y * stride + x * 4),
+                        4,
+                    );
+                }
+            }
+            assert!(pixels.unlock_lock_base_addr(flags).is_ok());
+        }
+        pixels
+    }
+
+    #[test]
+    fn concurrent_readers_preserve_native_pixels() {
+        let frame = NativeFrame {
+            image: colored_pixel_buffer(),
+            conversion_lock: Arc::new(Mutex::new(())),
+        };
+        let start = Arc::new(Barrier::new(9));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let frame = frame.clone();
+            let start = start.clone();
+            readers.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..128 {
+                    let converted = convert_latched_frame(frame.clone()).unwrap();
+                    assert_eq!(converted.dimensions(), (64, 32));
+                    assert!(converted
+                        .pixels()
+                        .all(|pixel| pixel.0 == [0xa4, 0x72, 0x31, 0xff]));
+                }
+            }));
+        }
+        drop(frame);
+        start.wait();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn busy_reader_does_not_block_callback_replacement() {
+        let mut receiver = FrameReceiverInner {
+            latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
+            frame_notify: Arc::new(tokio::sync::Notify::new()),
+            frame_tx: None,
+            frame_seq: Arc::new(AtomicU64::new(0)),
+        };
+        receiver.receive_image_buf(colored_pixel_buffer());
+        let frame = receiver.latest_frame.lock().unwrap().clone().unwrap();
+        let conversion_lock = frame.conversion_lock.clone();
+        let held = conversion_lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(convert_latched_frame(frame).unwrap())
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let (replaced_tx, replaced_rx) = mpsc::channel();
+        let callback = thread::spawn(move || {
+            receiver.receive_image_buf(colored_pixel_buffer());
+            replaced_tx.send(()).unwrap();
+        });
+        replaced_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback must not wait for a busy pixel-buffer reader");
+        drop(held);
+        let image = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(image
+            .pixels()
+            .all(|pixel| pixel.0 == [0xa4, 0x72, 0x31, 0xff]));
+        reader.join().unwrap();
+        callback.join().unwrap();
     }
 
     // Native memory probe: run explicitly so normal tests stay small.
@@ -951,6 +1064,7 @@ mod stream_manager_regression_tests {
         let before = footprint();
         let mut receiver = FrameReceiverInner {
             latest_frame: Arc::new(Mutex::new(None)),
+            conversion_lock: Arc::new(Mutex::new(())),
             frame_notify: Arc::new(tokio::sync::Notify::new()),
             frame_tx: None,
             frame_seq: Arc::new(AtomicU64::new(0)),
