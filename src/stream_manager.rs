@@ -41,10 +41,12 @@ struct NativeFrame {
 
 impl NativeFrame {
     fn from_owned_image(image: arc::R<cv::ImageBuf>, conversion_lock: Arc<Mutex<()>>) -> Self {
-        // Transfer exactly one +1 reference. No cidre reference survives this
-        // transfer or is reconstructed when readers clone, convert or drop it.
-        let pointer = NonNull::from(&*image).cast();
-        std::mem::forget(image);
+        // cidre::Retained is repr(transparent) over a non-null reference.
+        // Move its owned +1 reference directly into the raw handle, preserving
+        // provenance without creating a shared reborrow or running its Drop.
+        // No Rust reference is reconstructed by Clone, Drop or conversion.
+        let pointer =
+            unsafe { std::mem::transmute::<arc::R<cv::ImageBuf>, NonNull<c_void>>(image) };
         Self {
             image: pointer,
             conversion_lock,
