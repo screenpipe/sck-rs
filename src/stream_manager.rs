@@ -24,26 +24,68 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{ffi::c_void, ptr::NonNull};
 use tracing::{debug, info, warn};
 
-use crate::capture::{await_sck_callback, get_shareable_content, safe_image_buf_to_rgba};
+use crate::capture::{
+    await_sck_callback, get_shareable_content, safe_image_buf_to_rgba, safe_raw_image_buf_to_rgba,
+};
 use crate::error::{XCapError, XCapResult};
 
 // ── Frame receiver (ObjC callback) ─────────────────────────────────
 
-#[derive(Clone)]
 struct NativeFrame {
-    image: arc::R<cv::ImageBuf>,
+    image: NonNull<c_void>,
     conversion_lock: Arc<Mutex<()>>,
 }
 
-// SAFETY: ScreenCaptureKit delivers completed, immutable pixel buffers. The
-// retained CoreVideo handle keeps its surface alive across callback return and
-// prevents reuse while a reader owns it. NativeFrame exposes no mutation API:
-// conversion only reads pixels under CVPixelBuffer's READ_ONLY base-address lock.
-// Each retained handle is owned by one thread. A stream-scoped mutex serializes
-// native CPU lock/copy operations across cloned handles; the callback never waits
-// on that mutex, and latch access has its own short-held mutex.
+impl NativeFrame {
+    fn from_owned_image(image: arc::R<cv::ImageBuf>, conversion_lock: Arc<Mutex<()>>) -> Self {
+        // Transfer exactly one +1 reference. No cidre reference survives this
+        // transfer or is reconstructed when readers clone, convert or drop it.
+        let pointer = NonNull::from(&*image).cast();
+        std::mem::forget(image);
+        Self {
+            image: pointer,
+            conversion_lock,
+        }
+    }
+}
+
+impl Clone for NativeFrame {
+    fn clone(&self) -> Self {
+        // CoreFoundation retain/release are atomic. Each handle owns one retain.
+        unsafe {
+            CFRetain(self.image.as_ptr());
+        }
+        Self {
+            image: self.image,
+            conversion_lock: self.conversion_lock.clone(),
+        }
+    }
+}
+
+impl Drop for NativeFrame {
+    fn drop(&mut self) {
+        unsafe {
+            CFRelease(self.image.as_ptr());
+        }
+    }
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRetain(value: *const c_void) -> *const c_void;
+    fn CFRelease(value: *const c_void);
+    #[cfg(test)]
+    fn CFGetRetainCount(value: *const c_void) -> isize;
+}
+
+// SAFETY: Only completed, immutable SCK pixel buffers enter this latch. Each
+// raw handle owns a +1 native retain until Drop. No Rust reference to the
+// native object crosses threads or is constructed by Clone/Drop/conversion.
+// CPU pixel access is serialized by conversion_lock and CoreVideo's read lock;
+// the callback never takes that lock. No mutation or raw pointer is public.
 unsafe impl Send for NativeFrame {}
 
 #[repr(C)]
@@ -164,10 +206,10 @@ impl FrameReceiverInner {
         // Replacing the retained buffer releases the previous surface; a reader
         // retains its own handle before dropping the mutex and converting.
         let previous = if let Ok(mut guard) = self.latest_frame.lock() {
-            guard.replace(NativeFrame {
-                image: image_buf,
-                conversion_lock: self.conversion_lock.clone(),
-            })
+            guard.replace(NativeFrame::from_owned_image(
+                image_buf,
+                self.conversion_lock.clone(),
+            ))
         } else {
             return;
         };
@@ -176,14 +218,15 @@ impl FrameReceiverInner {
     }
 }
 
-fn convert_latched_frame(mut frame: NativeFrame) -> XCapResult<RgbaImage> {
+fn convert_latched_frame(frame: NativeFrame) -> XCapResult<RgbaImage> {
     // Created once per stream, not per callback. Serialize only consumers: the
     // SCK callback can replace its latch while another thread reads an old frame.
     let _conversion = frame
         .conversion_lock
         .lock()
         .map_err(|_| XCapError::capture_failed("frame conversion lock poisoned"))?;
-    safe_image_buf_to_rgba(&mut frame.image)
+    // The owned retain keeps the buffer alive throughout the raw FFI call.
+    unsafe { safe_raw_image_buf_to_rgba(frame.image) }
 }
 
 // A ScreenCaptureKit stop completion is normally prompt, but macOS can fail to
@@ -968,10 +1011,7 @@ mod stream_manager_regression_tests {
 
     #[test]
     fn concurrent_readers_preserve_native_pixels() {
-        let frame = NativeFrame {
-            image: colored_pixel_buffer(),
-            conversion_lock: Arc::new(Mutex::new(())),
-        };
+        let frame = NativeFrame::from_owned_image(colored_pixel_buffer(), Arc::new(Mutex::new(())));
         let start = Arc::new(Barrier::new(9));
         let mut readers = Vec::new();
         for _ in 0..8 {
@@ -993,6 +1033,47 @@ mod stream_manager_regression_tests {
         for reader in readers {
             reader.join().unwrap();
         }
+    }
+
+    #[test]
+    fn native_frame_clones_balance_retains_across_threads() {
+        let frame = NativeFrame::from_owned_image(colored_pixel_buffer(), Arc::new(Mutex::new(())));
+        let anchor = frame.clone();
+        let baseline = unsafe { CFGetRetainCount(anchor.image.as_ptr()) };
+        let ready = Arc::new(Barrier::new(9));
+        let release = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let frame = frame.clone();
+            let ready = ready.clone();
+            let release = release.clone();
+            workers.push(thread::spawn(move || {
+                for _ in 0..128 {
+                    drop(frame.clone());
+                }
+                ready.wait();
+                release.wait();
+                drop(frame);
+            }));
+        }
+        ready.wait();
+        assert_eq!(
+            unsafe { CFGetRetainCount(anchor.image.as_ptr()) },
+            baseline + 8
+        );
+        drop(frame);
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            unsafe { CFGetRetainCount(anchor.image.as_ptr()) },
+            baseline - 1
+        );
+        assert_eq!(
+            convert_latched_frame(anchor).unwrap().dimensions(),
+            (64, 32)
+        );
     }
 
     #[test]

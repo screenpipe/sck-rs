@@ -857,6 +857,91 @@ pub(crate) fn safe_image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> XCapResult
     }
 }
 
+/// Convert an owned native latch buffer without constructing Rust references
+/// to its opaque CoreFoundation header.
+///
+/// # Safety
+/// `image` must be a live CVPixelBuffer retained for this entire call, with
+/// immutable completed pixels. Callers serialize CPU access for reader clones.
+pub(crate) unsafe fn safe_raw_image_buf_to_rgba(
+    image: std::ptr::NonNull<std::ffi::c_void>,
+) -> XCapResult<RgbaImage> {
+    #[cfg(test)]
+    FRAME_CONVERSIONS.with(|count| count.set(count.get() + 1));
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| unsafe {
+        raw_image_buf_to_rgba(image)
+    })) {
+        Ok(result) => result,
+        Err(_) => Err(XCapError::capture_failed(
+            "Panic in native pixel-buffer conversion",
+        )),
+    }
+}
+
+#[link(name = "CoreVideo", kind = "framework")]
+extern "C" {
+    fn CVPixelBufferGetWidth(image: *const std::ffi::c_void) -> usize;
+    fn CVPixelBufferGetHeight(image: *const std::ffi::c_void) -> usize;
+    fn CVPixelBufferGetPlaneCount(image: *const std::ffi::c_void) -> usize;
+    fn CVPixelBufferGetPixelFormatType(image: *const std::ffi::c_void) -> u32;
+    fn CVPixelBufferLockBaseAddress(image: *const std::ffi::c_void, flags: u64) -> i32;
+    fn CVPixelBufferUnlockBaseAddress(image: *const std::ffi::c_void, flags: u64) -> i32;
+}
+
+struct RawPixelReadLock(std::ptr::NonNull<std::ffi::c_void>);
+impl Drop for RawPixelReadLock {
+    fn drop(&mut self) {
+        // Exactly the same read-only flags as the matching successful lock.
+        unsafe {
+            CVPixelBufferUnlockBaseAddress(self.0.as_ptr(), 1);
+        }
+    }
+}
+
+unsafe fn raw_image_buf_to_rgba(
+    image: std::ptr::NonNull<std::ffi::c_void>,
+) -> XCapResult<RgbaImage> {
+    let pointer = image.as_ptr();
+    let width = CVPixelBufferGetWidth(pointer);
+    let height = CVPixelBufferGetHeight(pointer);
+    if width == 0
+        || height == 0
+        || width > 16384
+        || height > 16384
+        || CVPixelBufferGetPlaneCount(pointer) != 0
+        || CVPixelBufferGetPixelFormatType(pointer) != u32::from_be_bytes(*b"BGRA")
+    {
+        return Err(XCapError::capture_failed(
+            "Invalid non-planar BGRA latch buffer",
+        ));
+    }
+    let status = CVPixelBufferLockBaseAddress(pointer, 1); // kCVPixelBufferLock_ReadOnly
+    if status != 0 {
+        return Err(XCapError::capture_failed(format!(
+            "Failed to lock native pixel buffer: {status}"
+        )));
+    }
+    let _unlock = RawPixelReadLock(image);
+    let stride = CVPixelBufferGetBytesPerRow(pointer);
+    let pixels = CVPixelBufferGetBaseAddress(pointer);
+    let len = stride
+        .checked_mul(height)
+        .filter(|len| *len > 0 && *len <= isize::MAX as usize)
+        .ok_or_else(|| XCapError::capture_failed("Invalid native pixel-buffer size"))?;
+    if pixels.is_null() || stride < width * 4 {
+        return Err(XCapError::capture_failed(
+            "Invalid native pixel-buffer address or stride",
+        ));
+    }
+    bgra_to_rgba(
+        std::slice::from_raw_parts(pixels, len),
+        width,
+        height,
+        stride,
+    )
+    .ok_or_else(|| XCapError::capture_failed("Failed to convert native pixel buffer"))
+}
+
 /// Capture a single frame from a window using ScreenCaptureKit
 ///
 /// This captures the display containing the window and crops to the window bounds.
